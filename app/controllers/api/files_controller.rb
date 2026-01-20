@@ -9,13 +9,24 @@ module Api
       per_page = params[:per_page]&.to_i || 20
       status = params[:status]
 
+      # Validate pagination parameters
+      page = 1 if page < 1
+      per_page = 20 if per_page < 1 || per_page > 100
+
       files = current_user.uploaded_files.active.recent
       files = files.where(status: status) if status.present?
       
       # Simple pagination without gem
       total_count = files.count
       total_pages = (total_count.to_f / per_page).ceil
+      total_pages = 1 if total_pages < 1
+      
+      # Ensure page doesn't exceed total pages
+      page = total_pages if page > total_pages && total_pages > 0
+      
       offset = (page - 1) * per_page
+      offset = 0 if offset < 0
+      
       paginated_files = files.limit(per_page).offset(offset)
 
       render_success(
