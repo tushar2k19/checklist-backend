@@ -61,6 +61,21 @@ module Api
       else
         render_error("validation_error", uploaded_file.errors.full_messages.join(", "), status: :unprocessable_entity)
       end
+    rescue FileUploadService::DuplicateFileError => e
+      existing_file = e.existing_file
+      file_name = existing_file.display_name || existing_file.original_filename
+      uploaded_date = existing_file.created_at.strftime("%B %d, %Y at %I:%M %p")
+      
+      render_error(
+        "duplicate_file",
+        "This file has already been uploaded. File name: #{file_name}. Uploaded on: #{uploaded_date}.",
+        status: :conflict,
+        details: {
+          existing_file_id: existing_file.id,
+          existing_file_name: file_name,
+          uploaded_at: existing_file.created_at
+        }
+      )
     rescue => e
       render_error("file_upload_error", e.message, status: :unprocessable_entity)
     end
