@@ -91,14 +91,12 @@ module Api
       end
 
       begin
-        # 4. Call OpenAI Service
+        # 4. Call OpenAI Service with retry logic
         start_time = Time.now
-        openai_service = OpenaiService.new
-        
-        analysis_response = openai_service.analyze_checklist(
-          uploaded_file_id: uploaded_file.openai_file_id,
-          vector_store_id: uploaded_file.openai_vector_store_id,
-          checklist_items: checklist_texts
+        analysis_response = perform_analysis_with_retry(
+          uploaded_file: uploaded_file,
+          checklist_items: checklist_texts,
+          evaluation: evaluation
         )
         
         results = analysis_response[:results]
@@ -134,6 +132,8 @@ module Api
         
       rescue => e
         evaluation.mark_as_failed!(e.message)
+        Rails.logger.error "Evaluation #{evaluation.id} failed after retries: #{e.message}"
+        Rails.logger.error e.backtrace.join("\n")
         render_error("evaluation_failed", "Evaluation failed: #{e.message}", status: :internal_server_error)
       end
     end
@@ -176,6 +176,76 @@ module Api
         }
       end
       base
+    end
+    
+    # Perform analysis with retry logic (3 attempts, exponential backoff)
+    def perform_analysis_with_retry(uploaded_file:, checklist_items:, evaluation:, max_retries: 3)
+      attempt = 0
+      last_error = nil
+      
+      while attempt < max_retries
+        attempt += 1
+        begin
+          Rails.logger.info "Evaluation #{evaluation.id}: Analysis attempt #{attempt}/#{max_retries}"
+          
+          # Update evaluation status to processing before each attempt
+          evaluation.update!(status: 'processing') if attempt == 1
+          
+          openai_service = OpenaiService.new
+          analysis_response = openai_service.analyze_checklist(
+            uploaded_file_id: uploaded_file.openai_file_id,
+            vector_store_id: uploaded_file.openai_vector_store_id,
+            checklist_items: checklist_items
+          )
+          
+          Rails.logger.info "Evaluation #{evaluation.id}: Analysis completed successfully on attempt #{attempt}"
+          return analysis_response
+          
+        rescue => e
+          last_error = e
+          is_retryable = retryable_error?(e)
+          
+          Rails.logger.warn "Evaluation #{evaluation.id}: Analysis attempt #{attempt} failed: #{e.message}"
+          
+          if attempt < max_retries && is_retryable
+            wait_time = calculate_backoff(attempt)
+            Rails.logger.warn "Evaluation #{evaluation.id}: Retrying in #{wait_time}s... (attempt #{attempt + 1}/#{max_retries})"
+            sleep wait_time
+          else
+            if !is_retryable
+              Rails.logger.error "Evaluation #{evaluation.id}: Non-retryable error, stopping retries"
+            else
+              Rails.logger.error "Evaluation #{evaluation.id}: Max retries (#{max_retries}) reached"
+            end
+            raise e
+          end
+        end
+      end
+      
+      raise last_error if last_error
+    end
+    
+    # Check if error is retryable
+    def retryable_error?(error)
+      error_message = error.message.downcase
+      
+      # Retry on network errors, timeouts, and 5xx server errors
+      return true if error_message.include?('timeout') || error_message.include?('timed out')
+      return true if error_message.include?('connection') || error_message.include?('network')
+      return true if error_message.include?('500') || error_message.include?('502') || 
+                     error_message.include?('503') || error_message.include?('504')
+      
+      # Retry on OpenAI API rate limits and temporary errors
+      return true if error_message.include?('rate limit') || error_message.include?('429')
+      return true if error_message.include?('service unavailable') || error_message.include?('temporary')
+      
+      false
+    end
+    
+    # Calculate exponential backoff delay
+    def calculate_backoff(attempt)
+      # Exponential backoff: 2s, 4s, 8s (capped at 10 seconds)
+      [2 ** attempt, 10].min
     end
   end
 end
