@@ -144,25 +144,43 @@ class VectorStoreService
   end
 
   def delete_vector_store(vector_store_id, max_retries: 3)
-    return unless vector_store_id.present?
+    unless vector_store_id.present?
+      Rails.logger.warn "[VectorStoreService] delete_vector_store called with nil/empty vector_store_id"
+      return false
+    end
     
-    Rails.logger.info "Deleting vector store: #{vector_store_id}"
+    Rails.logger.info "[VectorStoreService] Starting deletion of vector store: #{vector_store_id}"
+    Rails.logger.info "[VectorStoreService] Max retries: #{max_retries}"
     
-    retry_with_backoff(max_retries: max_retries, operation: "delete vector store", raise_on_failure: false) do
+    result = retry_with_backoff(max_retries: max_retries, operation: "delete vector store", raise_on_failure: false) do |attempt|
+      Rails.logger.info "[VectorStoreService] Delete attempt #{attempt}/#{max_retries} for vector store: #{vector_store_id}"
+      
       response = self.class.delete(
         "/vector_stores/#{vector_store_id}",
         headers: @headers,
         timeout: DEFAULT_TIMEOUT
       )
       
+      Rails.logger.info "[VectorStoreService] API Response Code: #{response.code}"
+      
       if response.success?
-        Rails.logger.info "Successfully deleted vector store: #{vector_store_id}"
+        Rails.logger.info "[VectorStoreService] ✅ Successfully deleted vector store: #{vector_store_id}"
         true
       else
-        Rails.logger.error "Failed to delete vector store: #{response.body}"
+        Rails.logger.error "[VectorStoreService] ❌ Failed to delete vector store: #{vector_store_id}"
+        Rails.logger.error "[VectorStoreService] Response Code: #{response.code}"
+        Rails.logger.error "[VectorStoreService] Response Body: #{response.body}"
         false
       end
     end
+    
+    if result
+      Rails.logger.info "[VectorStoreService] Vector store deletion completed successfully: #{vector_store_id}"
+    else
+      Rails.logger.warn "[VectorStoreService] Vector store deletion failed or returned false: #{vector_store_id}"
+    end
+    
+    result
   end
 
   private

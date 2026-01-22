@@ -1,5 +1,6 @@
 class UploadedFile < ApplicationRecord
   belongs_to :user
+  belongs_to :deleted_by, class_name: 'User', optional: true
   has_many :evaluations, dependent: :destroy
 
   # Validations
@@ -27,6 +28,11 @@ class UploadedFile < ApplicationRecord
   # Scopes
   scope :active, -> { where.not(status: 'deleted') }
   scope :expired, -> { where('expires_at < ?', Time.current) }
+  scope :expired_for_cleanup, -> {
+    where('expires_at < ?', Time.current)
+      .where(deleted_at: nil)
+      .where.not(status: 'deleted')
+  }
   scope :ready_for_analysis, -> { where(status: 'ready', vector_store_status: 'completed') }
   scope :recent, -> { order(created_at: :desc) }
 
@@ -53,8 +59,13 @@ class UploadedFile < ApplicationRecord
     update!(status: 'ready', error_message: nil)
   end
 
-  def mark_as_deleted!
-    update!(status: 'deleted', deleted_at: Time.current)
+  def mark_as_deleted!(deleted_by_user: nil, deletion_source: 'user')
+    update!(
+      status: 'deleted',
+      deleted_at: Time.current,
+      deleted_by: deleted_by_user,
+      deletion_source: deletion_source
+    )
   end
 
   def mark_as_error!(message)

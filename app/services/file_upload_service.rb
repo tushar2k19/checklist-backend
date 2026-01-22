@@ -141,6 +141,53 @@ class FileUploadService
     end
   end
 
+  # Public method for cleaning up OpenAI resources (used by cleanup job)
+  def cleanup_openai_resources(uploaded_file)
+    Rails.logger.info "[FileUploadService] Starting OpenAI resource cleanup for file ID: #{uploaded_file.id}"
+    
+    # Cleanup vector store first (if exists)
+    if uploaded_file.openai_vector_store_id.present?
+      Rails.logger.info "[FileUploadService] Attempting to delete vector store: #{uploaded_file.openai_vector_store_id}"
+      begin
+        result = @vector_store_service.delete_vector_store(uploaded_file.openai_vector_store_id, max_retries: 2)
+        if result
+          Rails.logger.info "[FileUploadService] ✅ Successfully deleted vector store: #{uploaded_file.openai_vector_store_id}"
+        else
+          Rails.logger.warn "[FileUploadService] ⚠️ Vector store deletion returned false (may have already been deleted): #{uploaded_file.openai_vector_store_id}"
+        end
+      rescue => e
+        Rails.logger.error "[FileUploadService] ❌ Failed to cleanup vector store #{uploaded_file.openai_vector_store_id}: #{e.class.name} - #{e.message}"
+        Rails.logger.error "[FileUploadService] Backtrace: #{e.backtrace.first(3).join("\n")}"
+      end
+    else
+      Rails.logger.info "[FileUploadService] No vector store ID found for file ID: #{uploaded_file.id} (skipping vector store cleanup)"
+    end
+    
+    # Cleanup file (if exists)
+    if uploaded_file.openai_file_id.present?
+      Rails.logger.info "[FileUploadService] Attempting to delete OpenAI file: #{uploaded_file.openai_file_id}"
+      begin
+        result = @openai_file_service.delete_file(uploaded_file.openai_file_id, max_retries: 2)
+        if result
+          Rails.logger.info "[FileUploadService] ✅ Successfully deleted OpenAI file: #{uploaded_file.openai_file_id}"
+        else
+          Rails.logger.warn "[FileUploadService] ⚠️ OpenAI file deletion returned false (may have already been deleted): #{uploaded_file.openai_file_id}"
+        end
+      rescue => e
+        Rails.logger.error "[FileUploadService] ❌ Failed to cleanup OpenAI file #{uploaded_file.openai_file_id}: #{e.class.name} - #{e.message}"
+        Rails.logger.error "[FileUploadService] Backtrace: #{e.backtrace.first(3).join("\n")}"
+      end
+    else
+      Rails.logger.info "[FileUploadService] No OpenAI file ID found for file ID: #{uploaded_file.id} (skipping file cleanup)"
+    end
+    
+    Rails.logger.info "[FileUploadService] Completed OpenAI resource cleanup for file ID: #{uploaded_file.id}"
+  end
+
+  def cleanup_openai_resources_for(uploaded_file)
+    cleanup_openai_resources(uploaded_file)
+  end
+
   private
 
   def validate_file(file)
@@ -166,27 +213,5 @@ class FileUploadService
     
     # Return the existing file (caller will check if it's expired)
     existing_file
-  end
-
-  def cleanup_openai_resources(uploaded_file)
-    # Cleanup vector store first (if exists)
-    if uploaded_file.openai_vector_store_id.present?
-      begin
-        @vector_store_service.delete_vector_store(uploaded_file.openai_vector_store_id, max_retries: 2)
-        Rails.logger.info "[FileUploadService] Cleaned up vector store: #{uploaded_file.openai_vector_store_id}"
-      rescue => e
-        Rails.logger.error "[FileUploadService] Failed to cleanup vector store: #{e.message}"
-      end
-    end
-    
-    # Cleanup file (if exists)
-    if uploaded_file.openai_file_id.present?
-      begin
-        @openai_file_service.delete_file(uploaded_file.openai_file_id, max_retries: 2)
-        Rails.logger.info "[FileUploadService] Cleaned up OpenAI file: #{uploaded_file.openai_file_id}"
-      rescue => e
-        Rails.logger.error "[FileUploadService] Failed to cleanup OpenAI file: #{e.message}"
-      end
-    end
   end
 end

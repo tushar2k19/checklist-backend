@@ -119,25 +119,43 @@ class OpenaiFileService
   end
 
   def delete_file(file_id, max_retries: 3)
-    return unless file_id.present?
+    unless file_id.present?
+      Rails.logger.warn "[OpenaiFileService] delete_file called with nil/empty file_id"
+      return false
+    end
     
-    Rails.logger.info "Deleting file from OpenAI: #{file_id}"
+    Rails.logger.info "[OpenaiFileService] Starting deletion of OpenAI file: #{file_id}"
+    Rails.logger.info "[OpenaiFileService] Max retries: #{max_retries}"
     
-    retry_with_backoff(max_retries: max_retries, operation: "delete file", raise_on_failure: false) do
+    result = retry_with_backoff(max_retries: max_retries, operation: "delete file", raise_on_failure: false) do |attempt|
+      Rails.logger.info "[OpenaiFileService] Delete attempt #{attempt}/#{max_retries} for file: #{file_id}"
+      
       response = self.class.delete(
         "/files/#{file_id}",
         headers: @headers,
         timeout: DEFAULT_TIMEOUT
       )
       
+      Rails.logger.info "[OpenaiFileService] API Response Code: #{response.code}"
+      
       if response.success?
-        Rails.logger.info "Successfully deleted file from OpenAI: #{file_id}"
+        Rails.logger.info "[OpenaiFileService] ✅ Successfully deleted file from OpenAI: #{file_id}"
         true
       else
-        Rails.logger.error "Failed to delete file from OpenAI inside delete_file(): #{response.body}"
+        Rails.logger.error "[OpenaiFileService] ❌ Failed to delete file from OpenAI: #{file_id}"
+        Rails.logger.error "[OpenaiFileService] Response Code: #{response.code}"
+        Rails.logger.error "[OpenaiFileService] Response Body: #{response.body}"
         false
       end
     end
+    
+    if result
+      Rails.logger.info "[OpenaiFileService] File deletion completed successfully: #{file_id}"
+    else
+      Rails.logger.warn "[OpenaiFileService] File deletion failed or returned false: #{file_id}"
+    end
+    
+    result
   end
 
   def get_file_details(file_id, max_retries: 3)
