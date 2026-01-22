@@ -61,7 +61,15 @@ class FileUploadService
       uploaded_file.update_progress_stage!('uploading_file')
       Rails.logger.info "[FileUploadService] Starting file upload for file #{uploaded_file.id}"
       
-      openai_file_id = @openai_file_service.upload_file(file.tempfile, max_retries: 3)
+      # Use file.original_filename directly to ensure we have the correct filename
+      original_filename = file.original_filename || uploaded_file.original_filename
+      Rails.logger.info "[FileUploadService] Using original filename: #{original_filename}"
+      
+      openai_file_id = @openai_file_service.upload_file(
+        file.tempfile, 
+        filename: original_filename, 
+        max_retries: 3
+      )
       uploaded_file.update!(openai_file_id: openai_file_id)
       Rails.logger.info "[FileUploadService] File uploaded to OpenAI: #{openai_file_id}"
       

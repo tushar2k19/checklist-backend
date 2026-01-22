@@ -1,14 +1,14 @@
 module Api
   class EvaluationsController < ApplicationController
     before_action :authenticate_user!
-    before_action :set_evaluation, only: [:show]
+    before_action :set_evaluation, only: [:show, :destroy]
 
     # GET /api/evaluations
     def index
       page = params[:page]&.to_i || 1
       per_page = params[:per_page]&.to_i || 20
       
-      evaluations = current_user.evaluations.recent(params[:days]&.to_i || 30)
+      evaluations = current_user.evaluations.not_deleted.recent(params[:days]&.to_i || 30)
       
       if params[:scheme_id].present?
         evaluations = evaluations.where(scheme_id: params[:scheme_id])
@@ -16,6 +16,10 @@ module Api
       
       if params[:document_type_id].present?
         evaluations = evaluations.where(document_type_id: params[:document_type_id])
+      end
+      
+      if params[:uploaded_file_id].present?
+        evaluations = evaluations.where(uploaded_file_id: params[:uploaded_file_id])
       end
 
       # Simple pagination without gem
@@ -93,15 +97,18 @@ module Api
       begin
         # 4. Call OpenAI Service with retry logic
         start_time = Time.now
+        log_accumulator = [] # Initialize log accumulator
         analysis_response = perform_analysis_with_retry(
           uploaded_file: uploaded_file,
           checklist_items: checklist_texts,
-          evaluation: evaluation
+          evaluation: evaluation,
+          log_accumulator: log_accumulator
         )
         
         results = analysis_response[:results]
         thread_id = analysis_response[:thread_id]
         processing_time = (Time.now - start_time).to_i
+        logs = analysis_response[:logs] || ""
         
         # 5. Store results
         ActiveRecord::Base.transaction do
@@ -125,7 +132,7 @@ module Api
         end
         
         render_success(
-          evaluation_detail_serializer(evaluation),
+          evaluation_detail_serializer(evaluation).merge(logs: logs),
           message: "Evaluation completed successfully",
           status: :created
         )
@@ -146,10 +153,24 @@ module Api
       )
     end
 
+    # DELETE /api/evaluations/:id
+    def destroy
+      if @evaluation.deleted?
+        return render_error("already_deleted", "Evaluation has already been deleted", status: :unprocessable_entity)
+      end
+      
+      @evaluation.soft_delete!(current_user)
+      
+      render_success(
+        { id: @evaluation.id },
+        message: "Evaluation deleted successfully"
+      )
+    end
+
     private
 
     def set_evaluation
-      @evaluation = current_user.evaluations.find(params[:id])
+      @evaluation = current_user.evaluations.not_deleted.find(params[:id])
     end
 
     def evaluation_serializer(e)
@@ -159,6 +180,7 @@ module Api
         scheme: e.scheme.name,
         document_type: e.document_type.name,
         filename: e.uploaded_file.original_filename,
+        uploaded_file_id: e.uploaded_file_id,
         status: e.status,
         summary: e.summary_stats,
         processing_time: e.processing_time
@@ -179,25 +201,33 @@ module Api
     end
     
     # Perform analysis with retry logic (3 attempts, exponential backoff)
-    def perform_analysis_with_retry(uploaded_file:, checklist_items:, evaluation:, max_retries: 3)
+    def perform_analysis_with_retry(uploaded_file:, checklist_items:, evaluation:, log_accumulator:, max_retries: 3)
       attempt = 0
       last_error = nil
       
       while attempt < max_retries
         attempt += 1
         begin
+          log_entry = "[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Evaluation #{evaluation.id}: Analysis attempt #{attempt}/#{max_retries}"
+          log_accumulator << log_entry
           Rails.logger.info "Evaluation #{evaluation.id}: Analysis attempt #{attempt}/#{max_retries}"
           
           # Update evaluation status to processing before each attempt
           evaluation.update!(status: 'processing') if attempt == 1
           
-          openai_service = OpenaiService.new
+          openai_service = OpenaiService.new(log_accumulator: log_accumulator)
           analysis_response = openai_service.analyze_checklist(
             uploaded_file_id: uploaded_file.openai_file_id,
             vector_store_id: uploaded_file.openai_vector_store_id,
             checklist_items: checklist_items
           )
           
+          # Get logs from service
+          logs = openai_service.get_logs
+          analysis_response[:logs] = logs
+          
+          log_entry = "[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Evaluation #{evaluation.id}: Analysis completed successfully on attempt #{attempt}"
+          log_accumulator << log_entry
           Rails.logger.info "Evaluation #{evaluation.id}: Analysis completed successfully on attempt #{attempt}"
           return analysis_response
           
@@ -205,16 +235,24 @@ module Api
           last_error = e
           is_retryable = retryable_error?(e)
           
+          log_entry = "[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Evaluation #{evaluation.id}: Analysis attempt #{attempt} failed: #{e.message}"
+          log_accumulator << log_entry
           Rails.logger.warn "Evaluation #{evaluation.id}: Analysis attempt #{attempt} failed: #{e.message}"
           
           if attempt < max_retries && is_retryable
             wait_time = calculate_backoff(attempt)
+            log_entry = "[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Evaluation #{evaluation.id}: Retrying in #{wait_time}s... (attempt #{attempt + 1}/#{max_retries})"
+            log_accumulator << log_entry
             Rails.logger.warn "Evaluation #{evaluation.id}: Retrying in #{wait_time}s... (attempt #{attempt + 1}/#{max_retries})"
             sleep wait_time
           else
             if !is_retryable
+              log_entry = "[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] Evaluation #{evaluation.id}: Non-retryable error, stopping retries"
+              log_accumulator << log_entry
               Rails.logger.error "Evaluation #{evaluation.id}: Non-retryable error, stopping retries"
             else
+              log_entry = "[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] Evaluation #{evaluation.id}: Max retries (#{max_retries}) reached"
+              log_accumulator << log_entry
               Rails.logger.error "Evaluation #{evaluation.id}: Max retries (#{max_retries}) reached"
             end
             raise e

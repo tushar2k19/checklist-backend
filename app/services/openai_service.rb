@@ -4,10 +4,11 @@ class OpenaiService
   # Base configuration
   base_uri 'https://api.openai.com/v1'
   
-  def initialize
+  def initialize(log_accumulator: nil)
     @api_key = ENV['OPENAI_API_KEY']
     @assistant_id = ENV['Checklist_ASSISTANT_ID']
     @model = ENV['OPENAI_MODEL'] || 'gpt-4o'
+    @log_accumulator = log_accumulator || []
     
     @headers = {
       'Authorization' => "Bearer #{@api_key}",
@@ -15,18 +16,31 @@ class OpenaiService
       'OpenAI-Beta' => 'assistants=v2'
     }
   end
+  
+  # Add log entry to accumulator
+  def add_log(level, message)
+    timestamp = Time.now.strftime('%Y-%m-%d %H:%M:%S')
+    log_entry = "[#{timestamp}] [#{level.upcase}] #{message}"
+    @log_accumulator << log_entry if @log_accumulator
+    Rails.logger.send(level.downcase.to_sym, message)
+  end
+  
+  # Get all logs as string
+  def get_logs
+    @log_accumulator ? @log_accumulator.join("\n") : ""
+  end
 
   # Analyze a checklist against a specific file (using vector store)
   # Supports batch processing for better accuracy (processes 3 items at a time)
   # Uses SINGLE THREAD for entire evaluation to avoid concurrency issues
   # Includes robust retry logic for failed batches
   def analyze_checklist(uploaded_file_id: nil, vector_store_id:, checklist_items:, batch_size: 3)
-    Rails.logger.info "=== Starting Checklist Analysis ==="
-    Rails.logger.info "Total items: #{checklist_items.length}, Batch size: #{batch_size}"
+    add_log('info', "=== Starting Checklist Analysis ===")
+    add_log('info', "Total items: #{checklist_items.length}, Batch size: #{batch_size}")
     
     # Create ONE thread for entire evaluation (reused across all batches)
     thread_id = create_thread(vector_store_id)
-    Rails.logger.info "Created single thread #{thread_id} for entire evaluation"
+    add_log('info', "Created single thread #{thread_id} for entire evaluation")
     
     # For small lists (<=3 items), process normally with retry
     if checklist_items.length <= batch_size
@@ -41,7 +55,7 @@ class OpenaiService
     
     batches.each_with_index do |batch_items, batch_index|
       batch_num = batch_index + 1
-      Rails.logger.info "Processing batch #{batch_num}/#{total_batches} (#{batch_items.length} items) on thread #{thread_id}"
+      add_log('info', "Processing batch #{batch_num}/#{total_batches} (#{batch_items.length} items) on thread #{thread_id}")
       
       begin
         # Process batch with retry logic (reusing same thread)
@@ -56,12 +70,12 @@ class OpenaiService
         
         # Longer delay between batches for large files (5 seconds)
         if batch_index < batches.length - 1
-          Rails.logger.info "Waiting 5 seconds before next batch (allows OpenAI to process large file)..."
+          add_log('info', "Waiting 5 seconds before next batch (allows OpenAI to process large file)...")
           sleep 5
         end
       rescue => e
-        Rails.logger.error "Batch #{batch_num} failed after all retries: #{e.message}"
-        Rails.logger.error "Error class: #{e.class}, Backtrace: #{e.backtrace.first(3).join(', ')}"
+        add_log('error', "Batch #{batch_num} failed after all retries: #{e.message}")
+        add_log('error', "Error class: #{e.class}, Backtrace: #{e.backtrace.first(3).join(', ')}")
         
         # Create placeholder results for failed batch items
         batch_items.each do |item|
@@ -90,30 +104,30 @@ class OpenaiService
     while attempt < max_retries
       attempt += 1
       begin
-        Rails.logger.info "Batch #{batch_num}: Attempt #{attempt}/#{max_retries} on thread #{thread_id}"
+        add_log('info', "Batch #{batch_num}: Attempt #{attempt}/#{max_retries} on thread #{thread_id}")
         
         batch_result = analyze_checklist_batch(thread_id, checklist_items, batch_num, total_batches)
         
-        Rails.logger.info "Batch #{batch_num}: Successfully completed on attempt #{attempt}"
+        add_log('info', "Batch #{batch_num}: Successfully completed on attempt #{attempt}")
         return batch_result
         
       rescue => e
         last_error = e
         is_retryable = is_retryable_error?(e)
         
-        Rails.logger.warn "Batch #{batch_num}: Attempt #{attempt} failed: #{e.message}"
-        Rails.logger.warn "Error class: #{e.class}, Retryable: #{is_retryable}"
+        add_log('warn', "Batch #{batch_num}: Attempt #{attempt} failed: #{e.message}")
+        add_log('warn', "Error class: #{e.class}, Retryable: #{is_retryable}")
         
         if attempt < max_retries && is_retryable
           # Longer backoff for large file processing: 10s, 20s, 40s (capped at 45s)
           wait_time = [10 * (2 ** (attempt - 1)), 45].min
-          Rails.logger.warn "Batch #{batch_num}: Retrying in #{wait_time}s... (attempt #{attempt + 1}/#{max_retries})"
+          add_log('warn', "Batch #{batch_num}: Retrying in #{wait_time}s... (attempt #{attempt + 1}/#{max_retries})")
           sleep wait_time
         else
           if !is_retryable
-            Rails.logger.error "Batch #{batch_num}: Non-retryable error, stopping retries"
+            add_log('error', "Batch #{batch_num}: Non-retryable error, stopping retries")
           else
-            Rails.logger.error "Batch #{batch_num}: Max retries (#{max_retries}) reached"
+            add_log('error', "Batch #{batch_num}: Max retries (#{max_retries}) reached")
           end
           raise e
         end
@@ -143,20 +157,21 @@ class OpenaiService
       
       # Step 4.5: If requires_action, extract results first, then submit tool outputs
       if run_data['status'] == 'requires_action'
-        Rails.logger.info "Run requires action, extracting results from function call..."
+        add_log('info', "Run requires action, extracting results from function call...")
         # Extract results from function call arguments BEFORE submitting tool outputs
         results = extract_results_from_requires_action(run_data)
         
         if results.length > 0
-          Rails.logger.info "Found #{results.length} results from requires_action, submitting tool outputs..."
+          add_log('info', "Found #{results.length} results from requires_action, submitting tool outputs...")
           # Submit tool outputs to acknowledge the function call
           submit_tool_outputs(thread_id, run_id, run_data)
           
           # CRITICAL: Wait for run to fully complete before returning
           # This prevents "Can't add messages while run is active" error on next batch
-          Rails.logger.info "Waiting for run to complete after tool outputs submission..."
-          wait_for_run_completion(thread_id, run_id, timeout: 120)
-          Rails.logger.info "Run completed, safe to proceed to next batch"
+          # After tool outputs, we MUST wait for 'completed' status only (not 'requires_action')
+          add_log('info', "Waiting for run to fully complete after tool outputs submission...")
+          wait_for_run_to_fully_complete(thread_id, run_id, timeout: 120)
+          add_log('info', "Run fully completed, safe to proceed to next batch")
           
           # Results are already extracted, return them
           return {
@@ -164,10 +179,10 @@ class OpenaiService
             thread_id: thread_id
           }
         else
-          Rails.logger.warn "No results found in requires_action, submitting tool outputs and checking messages..."
+          add_log('warn', "No results found in requires_action, submitting tool outputs and checking messages...")
           submit_tool_outputs(thread_id, run_id, run_data)
-          # Wait for completion again after submitting tool outputs
-          run_data = wait_for_run_completion(thread_id, run_id, timeout: 420)
+          # Wait for FULL completion after submitting tool outputs (must be 'completed', not 'requires_action')
+          run_data = wait_for_run_to_fully_complete(thread_id, run_id, timeout: 420)
         end
       end
       
@@ -176,21 +191,21 @@ class OpenaiService
       
       # Step 5.5: Log if we got plain text response instead of function call
       if results.length == 0 && run_data['status'] == 'completed'
-        Rails.logger.error "====== PLAIN TEXT RESPONSE DETECTED ======"
-        Rails.logger.error "Run completed without function call. Fetching assistant's response..."
+        add_log('error', "====== PLAIN TEXT RESPONSE DETECTED ======")
+        add_log('error', "Run completed without function call. Fetching assistant's response...")
         plain_text = extract_plain_text_response(thread_id)
         if plain_text
-          Rails.logger.error "Plain text response (first 500 chars): #{plain_text[0..500]}"
-          Rails.logger.error "========================================="
+          add_log('error', "Plain text response (first 500 chars): #{plain_text[0..500]}")
+          add_log('error', "=========================================")
         end
       end
       
       # Validate results match checklist items - treat 0 results as failure
       if results.length == 0
-        Rails.logger.error "Batch #{batch_num}: No results returned (0 results for #{checklist_items.length} items)"
+        add_log('error', "Batch #{batch_num}: No results returned (0 results for #{checklist_items.length} items)")
         raise "No results returned from OpenAI API. Expected #{checklist_items.length} results, got 0."
       elsif results.length != checklist_items.length
-        Rails.logger.warn "Batch #{batch_num}: Results count (#{results.length}) doesn't match items count (#{checklist_items.length})"
+        add_log('warn', "Batch #{batch_num}: Results count (#{results.length}) doesn't match items count (#{checklist_items.length})")
         # This is a warning but not a failure - we'll use what we got
       end
       
@@ -201,8 +216,8 @@ class OpenaiService
       }
       
     rescue => e
-      Rails.logger.error "Batch Analysis Failed: #{e.message}"
-      Rails.logger.error "Error class: #{e.class}"
+      add_log('error', "Batch Analysis Failed: #{e.message}")
+      add_log('error', "Error class: #{e.class}")
       raise e
     end
   end
@@ -314,6 +329,8 @@ class OpenaiService
     handle_response(response)['id']
   end
   
+  # Wait for run completion - returns on 'completed' OR 'requires_action'
+  # Used for initial wait to catch function calls
   def wait_for_run_completion(thread_id, run_id, timeout: 120)
     start_time = Time.now
     check_interval = 2 # Check every 2 seconds
@@ -329,6 +346,7 @@ class OpenaiService
         run_data = handle_response(response)
         status = run_data['status']
         
+        # Return on 'completed' OR 'requires_action' (for initial wait to catch function calls)
         return run_data if ['completed', 'requires_action'].include?(status)
         
         if ['failed', 'cancelled', 'expired'].include?(status)
@@ -345,13 +363,72 @@ class OpenaiService
             error_info.to_s
           end
           
-          Rails.logger.error "Run #{run_id} failed with status: #{status}, error: #{error_message}"
+          add_log('error', "Run #{run_id} failed with status: #{status}, error: #{error_message}")
           raise "Run failed: #{error_message}"
         end
         
         # Log progress for long-running runs
         if elapsed > 30 && elapsed % 30 < check_interval
-          Rails.logger.info "Run #{run_id} still in progress (status: #{status}, elapsed: #{elapsed.round}s)"
+          add_log('info', "Run #{run_id} still in progress (status: #{status}, elapsed: #{elapsed.round}s)")
+        end
+        
+        sleep check_interval
+      rescue => e
+        # If it's a network/API error, re-raise for retry logic
+        if e.message.include?('OpenAI API Error') || e.message.include?('server_error')
+          raise e
+        end
+        # Otherwise, continue checking
+        sleep check_interval
+      end
+    end
+  end
+  
+  # Wait for run to FULLY complete - ONLY returns on 'completed' status
+  # Used after submitting tool outputs to ensure run is completely done
+  def wait_for_run_to_fully_complete(thread_id, run_id, timeout: 120)
+    start_time = Time.now
+    check_interval = 2 # Check every 2 seconds
+    
+    loop do
+      elapsed = Time.now - start_time
+      if elapsed > timeout
+        raise "Run timed out after #{timeout} seconds"
+      end
+      
+      begin
+        response = self.class.get("/threads/#{thread_id}/runs/#{run_id}", headers: @headers)
+        run_data = handle_response(response)
+        status = run_data['status']
+        
+        # CRITICAL: Only return on 'completed' - not 'requires_action'
+        # After tool outputs, run must be fully completed before next batch
+        if status == 'completed'
+          add_log('info', "Run #{run_id} fully completed")
+          return run_data
+        end
+        
+        if ['failed', 'cancelled', 'expired'].include?(status)
+          error_info = run_data['last_error'] || {}
+          
+          # Extract error details properly
+          error_message = if error_info.is_a?(Hash)
+            code = error_info['code'] || 'unknown'
+            message = error_info['message'] || 'Unknown error'
+            "{\"code\":\"#{code}\",\"message\":\"#{message}\"}"
+          elsif error_info.is_a?(String)
+            error_info
+          else
+            error_info.to_s
+          end
+          
+          add_log('error', "Run #{run_id} failed with status: #{status}, error: #{error_message}")
+          raise "Run failed: #{error_message}"
+        end
+        
+        # Log progress for long-running runs
+        if elapsed > 10 && elapsed % 10 < check_interval
+          add_log('info', "Run #{run_id} still processing (status: #{status}, elapsed: #{elapsed.round}s)")
         end
         
         sleep check_interval
@@ -381,13 +458,13 @@ class OpenaiService
         
         if args.is_a?(Hash) && args['results']
           results = args['results'] || []
-          Rails.logger.info "Extracted #{results.length} results from function call arguments"
+          add_log('info', "Extracted #{results.length} results from function call arguments")
           return results
         end
       end
     end
     
-    Rails.logger.warn "No results found in requires_action tool calls"
+    add_log('warn', "No results found in requires_action tool calls")
     []
   end
   
@@ -421,16 +498,16 @@ class OpenaiService
     # This method is called for completed runs only (requires_action is handled earlier)
     # If run is completed, check messages for function calls
     if run_data['status'] == 'completed'
-      Rails.logger.info "Run completed, checking thread messages for function calls..."
+      add_log('info', "Run completed, checking thread messages for function calls...")
       results = extract_results_from_messages(thread_id, checklist_items)
       if results.length > 0
-        Rails.logger.info "Found #{results.length} results from completed run messages"
+        add_log('info', "Found #{results.length} results from completed run messages")
         return results
       end
     end
     
     # If we still have no results, log warning and return empty
-    Rails.logger.warn "No results found in messages. Run status: #{run_data['status']}"
+    add_log('warn', "No results found in messages. Run status: #{run_data['status']}")
     []
   end
   
@@ -460,7 +537,7 @@ class OpenaiService
             end
             
             if args.is_a?(Hash) && args['results']
-              Rails.logger.info "Found function call results in message #{message['id']}"
+              add_log('info', "Found function call results in message #{message['id']}")
               return args['results'] || []
             end
           end
@@ -478,17 +555,17 @@ class OpenaiService
             end
             
             if args.is_a?(Hash) && args['results']
-              Rails.logger.info "Found tool_call results in message #{message['id']}"
+              add_log('info', "Found tool_call results in message #{message['id']}")
               return args['results'] || []
             end
           end
         end
       end
       
-      Rails.logger.warn "No function call found in thread messages"
+      add_log('warn', "No function call found in thread messages")
       []
     rescue => e
-      Rails.logger.error "Error extracting results from messages: #{e.message}"
+      add_log('error', "Error extracting results from messages: #{e.message}")
       []
     end
   end
@@ -515,7 +592,7 @@ class OpenaiService
       
       nil
     rescue => e
-      Rails.logger.error "Error extracting plain text response: #{e.message}"
+      add_log('error', "Error extracting plain text response: #{e.message}")
       nil
     end
   end

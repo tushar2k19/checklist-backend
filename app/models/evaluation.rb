@@ -3,6 +3,7 @@ class Evaluation < ApplicationRecord
   belongs_to :uploaded_file
   belongs_to :scheme
   belongs_to :document_type
+  belongs_to :deleted_by, class_name: 'User', optional: true
   
   has_many :evaluation_checklist_items, dependent: :destroy
   has_many :checklist_items, through: :evaluation_checklist_items
@@ -26,6 +27,8 @@ class Evaluation < ApplicationRecord
   scope :by_user, ->(user_id) { where(user_id: user_id) }
   scope :by_scheme, ->(scheme_id) { where(scheme_id: scheme_id) }
   scope :completed, -> { where(status: 'completed') }
+  scope :not_deleted, -> { where(deleted_at: nil) }
+  scope :deleted, -> { where.not(deleted_at: nil) }
 
   # Callbacks
   before_create :set_evaluation_date
@@ -61,6 +64,18 @@ class Evaluation < ApplicationRecord
     
     update(summary_stats: stats)
     stats
+  end
+  
+  # Soft delete
+  def soft_delete!(deleted_by_user)
+    update!(
+      deleted_at: Time.current,
+      deleted_by_id: deleted_by_user.id
+    )
+  end
+  
+  def deleted?
+    deleted_at.present?
   end
   
   private
