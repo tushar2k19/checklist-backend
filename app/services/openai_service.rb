@@ -19,7 +19,7 @@ class OpenaiService
   
   # Add log entry to accumulator
   def add_log(level, message)
-    timestamp = Time.now.strftime('%Y-%m-%d %H:%M:%S')
+    timestamp = Time.zone.now.strftime('%Y-%m-%d %H:%M:%S %Z')
     log_entry = "[#{timestamp}] [#{level.upcase}] #{message}"
     @log_accumulator << log_entry if @log_accumulator
     Rails.logger.send(level.downcase.to_sym, message)
@@ -152,7 +152,7 @@ class OpenaiService
       run_id = create_checklist_run(thread_id)
       
       # Step 4: Wait for completion (longer timeout for large PDF processing)
-      start_time = Time.now
+      start_time = Time.zone.now
       run_data = wait_for_run_completion(thread_id, run_id, timeout: 420) # 7 minutes for 34MB files
       
       # Step 4.5: If requires_action, extract results first, then submit tool outputs
@@ -332,11 +332,11 @@ class OpenaiService
   # Wait for run completion - returns on 'completed' OR 'requires_action'
   # Used for initial wait to catch function calls
   def wait_for_run_completion(thread_id, run_id, timeout: 120)
-    start_time = Time.now
+    start_time = Time.zone.now
     check_interval = 2 # Check every 2 seconds
     
     loop do
-      elapsed = Time.now - start_time
+      elapsed = Time.zone.now - start_time
       if elapsed > timeout
         raise "Run timed out after #{timeout} seconds"
       end
@@ -387,11 +387,11 @@ class OpenaiService
   # Wait for run to FULLY complete - ONLY returns on 'completed' status
   # Used after submitting tool outputs to ensure run is completely done
   def wait_for_run_to_fully_complete(thread_id, run_id, timeout: 120)
-    start_time = Time.now
+    start_time = Time.zone.now
     check_interval = 2 # Check every 2 seconds
     
     loop do
-      elapsed = Time.now - start_time
+      elapsed = Time.zone.now - start_time
       if elapsed > timeout
         raise "Run timed out after #{timeout} seconds"
       end

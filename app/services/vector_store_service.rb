@@ -93,7 +93,7 @@ class VectorStoreService
   end
   
   def wait_for_vector_store_ready(vector_store_id, timeout: 600, interval: 3, progress_callback: nil)
-    start_time = Time.now
+    start_time = Time.zone.now
     last_status = nil
     
     loop do
@@ -131,7 +131,7 @@ class VectorStoreService
       end
       
       # Check timeout
-      elapsed = Time.now - start_time
+      elapsed = Time.zone.now - start_time
       if elapsed > timeout
         Rails.logger.warn "Timeout waiting for vector store #{vector_store_id} after #{elapsed.round}s"
         return 'timeout'

@@ -96,7 +96,7 @@ module Api
 
       begin
         # 4. Call OpenAI Service with retry logic
-        start_time = Time.now
+        start_time = Time.zone.now
         log_accumulator = [] # Initialize log accumulator
         analysis_response = perform_analysis_with_retry(
           uploaded_file: uploaded_file,
@@ -107,7 +107,7 @@ module Api
         
         results = analysis_response[:results]
         thread_id = analysis_response[:thread_id]
-        processing_time = (Time.now - start_time).to_i
+        processing_time = (Time.zone.now - start_time).to_i
         logs = analysis_response[:logs] || ""
         
         # 5. Store results
@@ -208,7 +208,7 @@ module Api
       while attempt < max_retries
         attempt += 1
         begin
-          log_entry = "[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Evaluation #{evaluation.id}: Analysis attempt #{attempt}/#{max_retries}"
+          log_entry = "[#{Time.zone.now.strftime('%Y-%m-%d %H:%M:%S %Z')}] [INFO] Evaluation #{evaluation.id}: Analysis attempt #{attempt}/#{max_retries}"
           log_accumulator << log_entry
           Rails.logger.info "Evaluation #{evaluation.id}: Analysis attempt #{attempt}/#{max_retries}"
           
@@ -226,7 +226,7 @@ module Api
           logs = openai_service.get_logs
           analysis_response[:logs] = logs
           
-          log_entry = "[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Evaluation #{evaluation.id}: Analysis completed successfully on attempt #{attempt}"
+          log_entry = "[#{Time.zone.now.strftime('%Y-%m-%d %H:%M:%S %Z')}] [INFO] Evaluation #{evaluation.id}: Analysis completed successfully on attempt #{attempt}"
           log_accumulator << log_entry
           Rails.logger.info "Evaluation #{evaluation.id}: Analysis completed successfully on attempt #{attempt}"
           return analysis_response
@@ -235,23 +235,23 @@ module Api
           last_error = e
           is_retryable = retryable_error?(e)
           
-          log_entry = "[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Evaluation #{evaluation.id}: Analysis attempt #{attempt} failed: #{e.message}"
+          log_entry = "[#{Time.zone.now.strftime('%Y-%m-%d %H:%M:%S %Z')}] [WARN] Evaluation #{evaluation.id}: Analysis attempt #{attempt} failed: #{e.message}"
           log_accumulator << log_entry
           Rails.logger.warn "Evaluation #{evaluation.id}: Analysis attempt #{attempt} failed: #{e.message}"
           
           if attempt < max_retries && is_retryable
             wait_time = calculate_backoff(attempt)
-            log_entry = "[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Evaluation #{evaluation.id}: Retrying in #{wait_time}s... (attempt #{attempt + 1}/#{max_retries})"
+            log_entry = "[#{Time.zone.now.strftime('%Y-%m-%d %H:%M:%S %Z')}] [WARN] Evaluation #{evaluation.id}: Retrying in #{wait_time}s... (attempt #{attempt + 1}/#{max_retries})"
             log_accumulator << log_entry
             Rails.logger.warn "Evaluation #{evaluation.id}: Retrying in #{wait_time}s... (attempt #{attempt + 1}/#{max_retries})"
             sleep wait_time
           else
             if !is_retryable
-              log_entry = "[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] Evaluation #{evaluation.id}: Non-retryable error, stopping retries"
+              log_entry = "[#{Time.zone.now.strftime('%Y-%m-%d %H:%M:%S %Z')}] [ERROR] Evaluation #{evaluation.id}: Non-retryable error, stopping retries"
               log_accumulator << log_entry
               Rails.logger.error "Evaluation #{evaluation.id}: Non-retryable error, stopping retries"
             else
-              log_entry = "[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] Evaluation #{evaluation.id}: Max retries (#{max_retries}) reached"
+              log_entry = "[#{Time.zone.now.strftime('%Y-%m-%d %H:%M:%S %Z')}] [ERROR] Evaluation #{evaluation.id}: Max retries (#{max_retries}) reached"
               log_accumulator << log_entry
               Rails.logger.error "Evaluation #{evaluation.id}: Max retries (#{max_retries}) reached"
             end
