@@ -8,7 +8,7 @@ class SigninController < ApplicationController
       tokens = session.login
 
       # Trigger file lifecycle cleanup job after successful login
-      trigger_file_cleanup(user)
+      trigger_file_cleanup
 
       render json: {
         success: true,
@@ -40,7 +40,7 @@ class SigninController < ApplicationController
 
   private
 
-  def trigger_file_cleanup(user)
+  def trigger_file_cleanup
     # Check if cleanup is enabled (default: enabled)
     cleanup_enabled = ENV['ENABLE_FILE_CLEANUP_ON_LOGIN'].blank? || ENV['ENABLE_FILE_CLEANUP_ON_LOGIN'] == 'true'
     
@@ -49,22 +49,20 @@ class SigninController < ApplicationController
       return
     end
     
-    return unless user
-    
-    # Check for expired files for THIS user only
-    expired_count = UploadedFile.expired_for_cleanup.where(user_id: user.id).count
+    # Check for expired files for ALL users
+    expired_count = UploadedFile.expired_for_cleanup.count
     
     if expired_count > 0
       Rails.logger.info "=" * 80
       Rails.logger.info "[SigninController] ===== TRIGGERING FILE LIFECYCLE CLEANUP ====="
-      Rails.logger.info "[SigninController] User logged in successfully: #{user.email} (ID: #{user.id})"
-      Rails.logger.info "[SigninController] Found #{expired_count} expired file(s) for this user that need cleanup"
-      Rails.logger.info "[SigninController] Queuing FileLifecycleCleanupJob for user ID: #{user.id}..."
-      FileLifecycleCleanupJob.perform_later(user.id)
+      Rails.logger.info "[SigninController] User logged in successfully"
+      Rails.logger.info "[SigninController] Found #{expired_count} expired file(s) that need cleanup (system-wide)"
+      Rails.logger.info "[SigninController] Queuing FileLifecycleCleanupJob..."
+      FileLifecycleCleanupJob.perform_later
       Rails.logger.info "[SigninController] File cleanup job queued successfully (will run in background)"
       Rails.logger.info "=" * 80
     else
-      Rails.logger.info "[SigninController] No expired files found for user #{user.email}. Cleanup job not needed."
+      Rails.logger.info "[SigninController] No expired files found. Cleanup job not needed."
     end
   end
 end

@@ -4,28 +4,15 @@ class FileLifecycleCleanupJob < ApplicationJob
   BATCH_SIZE = 10
   BATCH_DELAY = 2.seconds
 
-  def perform(user_id = nil)
+  def perform
     start_time = Time.current
     logger.info "=" * 80
     logger.info "[FileLifecycleCleanupJob] ===== FILE LIFECYCLE CLEANUP JOB STARTED ====="
     logger.info "[FileLifecycleCleanupJob] Started at: #{start_time.strftime('%Y-%m-%d %H:%M:%S')}"
-    
-    if user_id
-      user = User.find_by(id: user_id)
-      if user
-        logger.info "[FileLifecycleCleanupJob] Cleaning up expired files for user: #{user.email} (ID: #{user_id})"
-      else
-        logger.warn "[FileLifecycleCleanupJob] User ID #{user_id} not found. Cleaning up all expired files."
-        user_id = nil
-      end
-    else
-      logger.info "[FileLifecycleCleanupJob] No user_id provided. Cleaning up ALL expired files (system-wide)."
-    end
-    
+    logger.info "[FileLifecycleCleanupJob] Cleaning up ALL expired files (system-wide)"
     logger.info "=" * 80
     
     files_scope = UploadedFile.expired_for_cleanup
-    files_scope = files_scope.where(user_id: user_id) if user_id
     total = files_scope.count
     
     logger.info "[FileLifecycleCleanupJob] Checking for expired files..."

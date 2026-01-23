@@ -119,7 +119,7 @@ module Api
               evaluation.evaluation_checklist_items.create!(
                 checklist_item: matched_item,
                 status: result['status'],
-                remarks: result['remarks']
+                remarks: clean_remarks(result['remarks'])
               )
             end
           end
@@ -171,6 +171,22 @@ module Api
 
     def set_evaluation
       @evaluation = current_user.evaluations.not_deleted.find(params[:id])
+    end
+    
+    # Clean remarks by removing citation patterns like 【12:12†filename.pdf】
+    def clean_remarks(remarks)
+      return '' if remarks.blank?
+      
+      # Remove citation patterns: 【anything】
+      cleaned = remarks.gsub(/【[^】]*】/, '')
+      
+      # Remove dagger markers (†) that might be left behind
+      cleaned = cleaned.gsub(/†/, '')
+      
+      # Clean up extra whitespace
+      cleaned = cleaned.gsub(/\s{2,}/, ' ').strip
+      
+      cleaned
     end
 
     def evaluation_serializer(e)

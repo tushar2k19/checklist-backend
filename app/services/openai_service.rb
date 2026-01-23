@@ -256,7 +256,7 @@ class OpenaiService
       
       CORE RULES (STRICT ADHERENCE REQUIRED):
       1. Your analysis MUST be based ONLY on the document provided in the vector store for this thread. Do NOT use any external or prior knowledge.
-      2. You MUST use the file_search tool EXTENSIVELY and EXCLUSIVELY to retrieve information for EACH checklist item.
+      2. You MUST thoroughly search the document EXTENSIVELY for EACH checklist item to retrieve all relevant information.
       3. Search thoroughly: Information may be in different sections, pages, or use different terminology. Explore all relevant keywords and synonyms.
       4. Explicitly ignore all previous knowledge of state projects or other DPRs. If your response contains information not found in the current document, you MUST state so clearly in the remarks.
       5. If the document is a general document (e.g., proposal, random PDF) and not a valid DPR, mark all items as "No" and state "Document is not a valid DPR" in the remarks for each item.
@@ -267,7 +267,7 @@ class OpenaiService
       #{items_list}
 
       CRITICAL SEARCH INSTRUCTIONS (For EACH checklist item):
-      - Use the file_search tool to thoroughly search the document.
+      - Thoroughly search the document for relevant information.
       - Search using the exact item text AND related keywords/synonyms.
       - Explicitly check multiple sections of the document, as information may be spread across different pages.
       - Look for partial matches; sometimes, information exists but uses different terminology.
@@ -276,19 +276,19 @@ class OpenaiService
       STATUS EVALUATION GUIDELINES:
       - "Yes": The item is fully addressed, with all required information clearly present and verifiable within the provided document.
       - "Partial": The item is partially addressed – some information exists, but crucial aspects are missing or incomplete within the provided document.
-      - "No": After thorough and exhaustive searching using file_search, the required information is conclusively not found in the provided document.
+      - "No": After thorough and exhaustive searching, the required information is conclusively not found in the provided document.
 
       INSTRUCTIONS FOR REMARKS (Multi-Angle - Provide specific details/citations from the document):
       - If "Yes": Provide a comprehensive (100+ words) technical summary. Explicitly mention specific values, departments, dates, or page references found in the text. Clearly cite where the information appears within the document.
       - If "Partial": Clearly articulate what information IS present and what specific aspects are MISSING. Explain why the item is considered incomplete based *only* on the provided document.
-      - If "No": After confirming an exhaustive search, explicitly state: "Information regarding [Item] was not found in the provided document after extensive and focused searching using the file_search tool."
+      - If "No": After confirming an exhaustive search, explicitly state: "Information regarding [Item] was not found in the provided document after extensive and thorough review."
 
       EXAMPLES OF QUALITY ANALYSIS:
       - Angle 1 (Technical/Financial): "Yes. The report (page 12) specifies a total project cost of ₹45.6 Cr, with a clear breakdown into Civil (₹30Cr) and Electrical (₹15.6Cr) components. Implementation is scheduled over 18 months, with quarterly milestones detailed in section 4.2 of the DPR."
       - Angle 2 (Administrative/Compliance): "Partial. The document (chapter 3) mentions environmental impact assessment and forest clearance procedures. However, the specific 'No Objection Certificate' from the State Forest Department, mandatory as per guidelines section 5.2, is explicitly missing from the provided document."
-      - Angle 3 (Strategic/Rationale): "No. After extensive searching for terms like 'beneficiaries', 'target groups', 'stakeholders', and 'intended users' throughout the document using file_search, information regarding the specific intended beneficiaries and their identification process was not found in the provided document."
+      - Angle 3 (Strategic/Rationale): "No. After extensive searching the document, information regarding the specific intended beneficiaries and their identification process was not found in the provided document."
 
-      MANDATORY: You MUST return your findings by calling the 'return_checklist_results' function. Ensure you analyze ALL items in the checklist above, strictly adhering to the document provided and the rules of file_search. Your responses MUST ONLY reflect information found in the CURRENT document.
+      MANDATORY: You MUST return your findings by calling the 'return_checklist_results' function. Ensure you analyze ALL items in the checklist above, strictly adhering to the document provided. Your responses MUST ONLY reflect information found in the CURRENT document.
        PROMPT
   end
   
