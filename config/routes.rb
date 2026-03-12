@@ -23,7 +23,11 @@ Rails.application.routes.draw do
     resources :checklist_templates, only: [:index]
     
     # Evaluations
-    resources :evaluations, only: [:index, :create, :show, :destroy]
+    resources :evaluations, only: [:index, :create, :show, :destroy] do
+      resources :followup_questions,
+                only: [:create, :show],
+                controller: 'evaluations/followup_questions'
+    end
     
     # Legacy/Deprecated (to be removed)
     post 'checklist/analyze', to: 'checklist#analyze'

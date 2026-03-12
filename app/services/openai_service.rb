@@ -7,6 +7,8 @@ class OpenaiService
   def initialize(log_accumulator: nil)
     @api_key = ENV['OPENAI_API_KEY']
     @assistant_id = ENV['Checklist_ASSISTANT_ID']
+    # Use dedicated follow-up assistant if set; otherwise fall back to checklist assistant (has file_search; may have function tool but we only send text)
+    @followup_assistant_id = ENV['FOLLOWUP_ASSISTANT_ID'].presence || ENV['Checklist_ASSISTANT_ID']
     @model = ENV['OPENAI_MODEL'] || 'gpt-4o'
     @log_accumulator = log_accumulator || []
     
@@ -93,6 +95,57 @@ class OpenaiService
       results: all_results,
       thread_id: thread_id
     }
+  end
+
+  # Ask a follow-up question on a checklist item using a dedicated assistant.
+  # The first message injects checklist context; subsequent messages include
+  # only the user question and rely on thread history.
+  def ask_followup_question(evaluation_checklist_item:, vector_store_id:, message:, thread_id: nil)
+    raise 'No assistant configured: set FOLLOWUP_ASSISTANT_ID or Checklist_ASSISTANT_ID' if @followup_assistant_id.blank?
+    raise 'vector_store_id is required for follow-up questions' if vector_store_id.blank?
+
+    is_new_thread = thread_id.blank?
+    active_thread_id = thread_id.presence || create_thread(vector_store_id)
+
+    prompt = if is_new_thread
+      build_followup_initial_prompt(evaluation_checklist_item: evaluation_checklist_item, question: message)
+    else
+      message
+    end
+
+    send_message(active_thread_id, prompt)
+    run_id = create_followup_run(active_thread_id)
+    wait_for_run_completion(active_thread_id, run_id, timeout: 240)
+
+    answer = extract_latest_assistant_text(active_thread_id)
+    if answer.blank?
+      raise 'No follow-up response received from assistant'
+    end
+    normalized = normalize_followup_response(answer)
+
+    {
+      answer: normalized[:text],
+      status: normalized[:status],
+      thread_id: active_thread_id,
+      is_new_thread: is_new_thread
+    }
+  end
+
+  def fetch_thread_messages(thread_id:, limit: 50)
+    response = self.class.get("/threads/#{thread_id}/messages?limit=#{limit}", headers: @headers)
+    messages_data = handle_response(response)
+    messages = messages_data['data'] || []
+
+    messages.reverse.map do |message|
+      raw_content = extract_message_text_content(message)
+      normalized = message['role'] == 'assistant' ? normalize_followup_response(raw_content) : { text: raw_content, status: nil }
+      {
+        role: message['role'],
+        content: normalized[:text],
+        status: normalized[:status],
+        created_at: Time.at(message['created_at']).iso8601
+      }
+    end
   end
   
   # Analyze a single batch with retry logic
@@ -224,14 +277,15 @@ class OpenaiService
   
   private
 
-  def create_thread(vector_store_id)
-    payload = {
-      tool_resources: {
+  def create_thread(vector_store_id = nil)
+    payload = {}
+    if vector_store_id.present?
+      payload[:tool_resources] = {
         file_search: {
           vector_store_ids: [vector_store_id]
         }
       }
-    }
+    end
     
     response = self.class.post('/threads', headers: @headers, body: payload.to_json)
     handle_response(response)['id']
@@ -245,6 +299,137 @@ class OpenaiService
     
     response = self.class.post("/threads/#{thread_id}/messages", headers: @headers, body: payload.to_json)
     handle_response(response)['id']
+  end
+
+  def build_followup_initial_prompt(evaluation_checklist_item:, question:)
+    checklist_item = evaluation_checklist_item.checklist_item
+    <<~PROMPT
+      You are answering follow-up questions for a DPR checklist review.
+      Use only information from the current thread conversation and the DPR document attached to this thread via file search.
+      Do not use outside knowledge.
+      If requested information (including a specific page or section) is not present in the document, state that clearly and do not invent content.
+
+      Checklist item: #{checklist_item.item_text}
+      Status: #{evaluation_checklist_item.status}
+      Remarks: #{evaluation_checklist_item.remarks}
+
+      User question: #{question}
+    PROMPT
+  end
+
+  def create_followup_run(thread_id)
+    payload = {
+      assistant_id: @followup_assistant_id,
+      tools: [
+        { type: 'file_search' }
+      ]
+    }
+
+    response = self.class.post(
+      "/threads/#{thread_id}/runs",
+      headers: @headers,
+      body: payload.to_json
+    )
+    handle_response(response)['id']
+  end
+
+  def extract_latest_assistant_text(thread_id)
+    response = self.class.get("/threads/#{thread_id}/messages?limit=10", headers: @headers)
+    messages_data = handle_response(response)
+    messages = messages_data['data'] || []
+
+    assistant_message = messages.find { |message| message['role'] == 'assistant' }
+    return nil unless assistant_message
+
+    extract_message_text_content(assistant_message)
+  end
+
+  def extract_message_text_content(message)
+    content = message['content'] || []
+    text_chunks = content.filter_map do |content_item|
+      next unless content_item['type'] == 'text'
+      text = content_item.dig('text', 'value')
+      text if text.present?
+    end
+
+    text_chunks.join("\n").strip
+  end
+
+  # Normalize function-call-like text responses into plain answer format.
+  # Example input:
+  # return_checklist_results({"Item":{"Status":"Yes","Remarks":"..."}})
+  # Output:
+  # { text: "Status: Yes\n\nRemarks: ...", status: "Yes" }
+  def normalize_followup_response(raw_text)
+    text = raw_text.to_s.strip
+    return { text: text, status: nil } if text.blank?
+
+    json_payload = extract_return_checklist_results_payload(text)
+    return { text: text, status: nil } if json_payload.blank?
+
+    begin
+      parsed = JSON.parse(json_payload)
+      return { text: text, status: nil } unless parsed.is_a?(Hash)
+
+      # Shape A: {"Status":"Yes","Remarks":"..."}
+      if parsed.key?('Status') || parsed.key?('Remarks')
+        status = parsed['Status'].to_s.strip
+        remarks = parsed['Remarks'].to_s.strip
+        return { text: text, status: nil } if status.blank? && remarks.blank?
+
+        normalized_text = +""
+        normalized_text << "Status: #{status}" if status.present?
+        normalized_text << "\n\nRemarks: #{remarks}" if remarks.present?
+
+        clean_status = %w[Yes No Partial].include?(status) ? status : nil
+        return { text: normalized_text.strip, status: clean_status }
+      end
+
+      # Shape B: {"Item Name":{"Status":"Yes","Remarks":"..."}}
+      first_key, first_value = parsed.first
+      return { text: text, status: nil } unless first_value.is_a?(Hash)
+
+      status = first_value['Status'].to_s.strip
+      remarks = first_value['Remarks'].to_s.strip
+      return { text: text, status: nil } if status.blank? && remarks.blank?
+
+      normalized_text = +""
+      normalized_text << "Item: #{first_key}\n" if first_key.present?
+      normalized_text << "Status: #{status}" if status.present?
+      normalized_text << "\n\nRemarks: #{remarks}" if remarks.present?
+
+      clean_status = %w[Yes No Partial].include?(status) ? status : nil
+      { text: normalized_text.strip, status: clean_status }
+    rescue JSON::ParserError
+      { text: text, status: nil }
+    end
+  end
+
+  def extract_return_checklist_results_payload(text)
+    marker = 'return_checklist_results('
+    marker_index = text.index(marker)
+    return nil unless marker_index
+
+    start_index = marker_index + marker.length
+    depth = 0
+    payload_start = nil
+
+    i = start_index
+    while i < text.length
+      ch = text[i]
+      if ch == '{'
+        payload_start = i if payload_start.nil?
+        depth += 1
+      elsif ch == '}'
+        depth -= 1 if depth > 0
+        if depth == 0 && payload_start
+          return text[payload_start..i]
+        end
+      end
+      i += 1
+    end
+
+    nil
   end
   
   def build_checklist_prompt(checklist_items, batch_num = nil, total_batches = nil)
