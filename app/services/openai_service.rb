@@ -364,43 +364,69 @@ class OpenaiService
     text = raw_text.to_s.strip
     return { text: text, status: nil } if text.blank?
 
-    json_payload = extract_return_checklist_results_payload(text)
-    return { text: text, status: nil } if json_payload.blank?
+    # Check if this is a function call pattern
+    if text.include?('return_checklist_results(')
+      json_payload = extract_return_checklist_results_payload(text)
+      
+      # If we found a function call but couldn't extract valid JSON (e.g., empty array)
+      # provide a user-friendly message
+      if json_payload.blank?
+        return { 
+          text: "I apologize, but I couldn't find the specific information you're looking for in the document. Could you please rephrase your question or provide more context?",
+          status: nil 
+        }
+      end
 
-    begin
-      parsed = JSON.parse(json_payload)
-      return { text: text, status: nil } unless parsed.is_a?(Hash)
+      begin
+        parsed = JSON.parse(json_payload)
+        return { text: text, status: nil } unless parsed.is_a?(Hash)
 
-      # Shape A: {"Status":"Yes","Remarks":"..."}
-      if parsed.key?('Status') || parsed.key?('Remarks')
-        status = parsed['Status'].to_s.strip
-        remarks = parsed['Remarks'].to_s.strip
+        # Shape A: {"Status":"Yes","Remarks":"..."}
+        if parsed.key?('Status') || parsed.key?('Remarks')
+          status = parsed['Status'].to_s.strip
+          remarks = parsed['Remarks'].to_s.strip
+          return { text: text, status: nil } if status.blank? && remarks.blank?
+
+          normalized_text = +""
+          if status.present?
+            normalized_text << "Status: #{status}\n"
+          end
+          normalized_text << "Remarks:\n#{remarks}" if remarks.present?
+
+          clean_status = %w[Yes No Partial].include?(status) ? status : nil
+          return { text: normalized_text.strip, status: clean_status }
+        end
+
+        # Shape B: {"Item Name":{"Status":"Yes","Remarks":"..."}}
+        first_key, first_value = parsed.first
+        return { text: text, status: nil } unless first_value.is_a?(Hash)
+
+        status = first_value['Status'].to_s.strip
+        remarks = first_value['Remarks'].to_s.strip
         return { text: text, status: nil } if status.blank? && remarks.blank?
 
         normalized_text = +""
-        normalized_text << "Status: #{status}" if status.present?
-        normalized_text << "\n\nRemarks: #{remarks}" if remarks.present?
+        if first_key.present?
+          normalized_text << "Item: #{first_key}\n"
+        end
+        if status.present?
+          normalized_text << "Status: #{status}\n"
+        end
+        if remarks.present?
+          normalized_text << "Remarks:\n#{remarks}"
+        end
 
         clean_status = %w[Yes No Partial].include?(status) ? status : nil
-        return { text: normalized_text.strip, status: clean_status }
+        { text: normalized_text.strip, status: clean_status }
+      rescue JSON::ParserError
+        # If JSON parsing fails but we detected a function call, provide a friendly message
+        { 
+          text: "I apologize, but I encountered an issue processing the response. Could you please try rephrasing your question?",
+          status: nil 
+        }
       end
-
-      # Shape B: {"Item Name":{"Status":"Yes","Remarks":"..."}}
-      first_key, first_value = parsed.first
-      return { text: text, status: nil } unless first_value.is_a?(Hash)
-
-      status = first_value['Status'].to_s.strip
-      remarks = first_value['Remarks'].to_s.strip
-      return { text: text, status: nil } if status.blank? && remarks.blank?
-
-      normalized_text = +""
-      normalized_text << "Item: #{first_key}\n" if first_key.present?
-      normalized_text << "Status: #{status}" if status.present?
-      normalized_text << "\n\nRemarks: #{remarks}" if remarks.present?
-
-      clean_status = %w[Yes No Partial].include?(status) ? status : nil
-      { text: normalized_text.strip, status: clean_status }
-    rescue JSON::ParserError
+    else
+      # Normal text response - return as is
       { text: text, status: nil }
     end
   end
@@ -413,22 +439,37 @@ class OpenaiService
     start_index = marker_index + marker.length
     depth = 0
     payload_start = nil
+    bracket_type = nil  # Will be either '{' or '['
 
     i = start_index
     while i < text.length
       ch = text[i]
-      if ch == '{'
-        payload_start = i if payload_start.nil?
+      
+      # Handle both objects {} and arrays []
+      if ch == '{' || ch == '['
+        if payload_start.nil?
+          payload_start = i
+          bracket_type = ch
+        end
         depth += 1
-      elsif ch == '}'
+      elsif (ch == '}' && bracket_type == '{') || (ch == ']' && bracket_type == '[')
         depth -= 1 if depth > 0
         if depth == 0 && payload_start
-          return text[payload_start..i]
+          payload = text[payload_start..i]
+          # Special case: If it's an empty array or empty object, return nil
+          stripped_payload = payload.strip
+          return nil if stripped_payload == '[]' || stripped_payload == '{}'
+          return payload
         end
+      elsif ch == ')' && payload_start.nil?
+        # Function call with no payload: return_checklist_results()
+        return nil
       end
       i += 1
     end
 
+    # If we reached here and found a payload_start but never closed it,
+    # the function call is malformed
     nil
   end
   
