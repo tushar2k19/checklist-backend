@@ -70,6 +70,17 @@ module Api
           @evaluation_checklist_item.update!(openai_followup_thread_id: response[:thread_id])
         end
 
+        # Persist token usage for admin analytics
+        if response[:input_tokens].to_i.positive? || response[:output_tokens].to_i.positive?
+          TokenUsage.record_followup!(
+            user_id: current_user.id,
+            evaluation_id: @evaluation.id,
+            input_tokens: response[:input_tokens].to_i,
+            output_tokens: response[:output_tokens].to_i,
+            total_tokens: response[:total_tokens].to_i
+          )
+        end
+
         render_success(
           {
             answer: response[:answer],

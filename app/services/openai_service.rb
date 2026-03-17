@@ -26,6 +26,36 @@ class OpenaiService
     @log_accumulator << log_entry if @log_accumulator
     Rails.logger.send(level.downcase.to_sym, message)
   end
+
+  # Log token usage from run response (for cost tracking)
+  def log_run_usage(run_data, label = "Run")
+    return unless run_data.is_a?(Hash)
+    usage = run_data['usage']
+    return unless usage.is_a?(Hash)
+    # Assistants API v2 may use input_tokens/output_tokens or prompt_tokens/completion_tokens
+    pt = usage['input_tokens'] || usage['prompt_tokens']
+    ct = usage['output_tokens'] || usage['completion_tokens']
+    total = usage['total_tokens']
+    if pt || ct || total
+      add_log('info', "[TOKEN_USAGE] #{label}: input=#{pt || '?'} output=#{ct || '?'} total=#{total || '?'}")
+    end
+  end
+
+  # Extract usage hash from run response for persistence. Returns nil if no usage.
+  def extract_usage_from_run(run_data)
+    return nil unless run_data.is_a?(Hash)
+    usage = run_data['usage']
+    return nil unless usage.is_a?(Hash)
+    pt = usage['input_tokens'] || usage['prompt_tokens']
+    ct = usage['output_tokens'] || usage['completion_tokens']
+    total = usage['total_tokens']
+    return nil unless pt || ct || total
+    {
+      input_tokens: (pt || 0).to_i,
+      output_tokens: (ct || 0).to_i,
+      total_tokens: (total || (pt.to_i + ct.to_i)).to_i
+    }
+  end
   
   # Get all logs as string
   def get_logs
@@ -47,29 +77,41 @@ class OpenaiService
     # For small lists (<=3 items), process normally with retry
     if checklist_items.length <= batch_size
       Rails.logger.info "Processing all items in single batch"
-      return analyze_checklist_batch_with_retry(thread_id, checklist_items, 1, 1)
+      single = analyze_checklist_batch_with_retry(thread_id, checklist_items, 1, 1)
+      u = single[:usage]
+      return single.merge(
+        evaluation_input_tokens: u&.dig(:input_tokens).to_i,
+        evaluation_output_tokens: u&.dig(:output_tokens).to_i
+      )
     end
-    
+
     # Batch processing for larger lists with retry logic (using SAME thread)
     all_results = []
+    total_input = 0
+    total_output = 0
     batches = checklist_items.each_slice(batch_size).to_a
     total_batches = batches.length
-    
+
     batches.each_with_index do |batch_items, batch_index|
       batch_num = batch_index + 1
       add_log('info', "Processing batch #{batch_num}/#{total_batches} (#{batch_items.length} items) on thread #{thread_id}")
-      
+
       begin
         # Process batch with retry logic (reusing same thread)
         batch_result = analyze_checklist_batch_with_retry(
-          thread_id, 
-          batch_items, 
-          batch_num, 
+          thread_id,
+          batch_items,
+          batch_num,
           total_batches,
           max_retries: 3
         )
         all_results.concat(batch_result[:results])
-        
+        u = batch_result[:usage]
+        if u
+          total_input += u[:input_tokens].to_i
+          total_output += u[:output_tokens].to_i
+        end
+
         # Longer delay between batches for large files (5 seconds)
         if batch_index < batches.length - 1
           add_log('info', "Waiting 5 seconds before next batch (allows OpenAI to process large file)...")
@@ -78,7 +120,7 @@ class OpenaiService
       rescue => e
         add_log('error', "Batch #{batch_num} failed after all retries: #{e.message}")
         add_log('error', "Error class: #{e.class}, Backtrace: #{e.backtrace.first(3).join(', ')}")
-        
+
         # Create placeholder results for failed batch items
         batch_items.each do |item|
           all_results << {
@@ -89,11 +131,13 @@ class OpenaiService
         end
       end
     end
-    
-    # Return combined results with the single thread_id
+
+    # Return combined results with the single thread_id and accumulated token usage
     {
       results: all_results,
-      thread_id: thread_id
+      thread_id: thread_id,
+      evaluation_input_tokens: total_input,
+      evaluation_output_tokens: total_output
     }
   end
 
@@ -115,7 +159,9 @@ class OpenaiService
 
     send_message(active_thread_id, prompt)
     run_id = create_followup_run(active_thread_id)
-    wait_for_run_completion(active_thread_id, run_id, timeout: 240)
+    run_data = wait_for_run_completion(active_thread_id, run_id, timeout: 240)
+    log_run_usage(run_data, "Follow-up question")
+    followup_usage = extract_usage_from_run(run_data)
 
     answer = extract_latest_assistant_text(active_thread_id)
     if answer.blank?
@@ -127,7 +173,10 @@ class OpenaiService
       answer: normalized[:text],
       status: normalized[:status],
       thread_id: active_thread_id,
-      is_new_thread: is_new_thread
+      is_new_thread: is_new_thread,
+      input_tokens: followup_usage&.dig(:input_tokens).to_i,
+      output_tokens: followup_usage&.dig(:output_tokens).to_i,
+      total_tokens: followup_usage&.dig(:total_tokens).to_i
     }
   end
 
@@ -207,38 +256,44 @@ class OpenaiService
       # Step 4: Wait for completion (longer timeout for large PDF processing)
       start_time = Time.zone.now
       run_data = wait_for_run_completion(thread_id, run_id, timeout: 420) # 7 minutes for 34MB files
-      
+      log_run_usage(run_data, "Batch #{batch_num}/#{total_batches} (after run completion)")
+      batch_usage = extract_usage_from_run(run_data)
+
       # Step 4.5: If requires_action, extract results first, then submit tool outputs
       if run_data['status'] == 'requires_action'
         add_log('info', "Run requires action, extracting results from function call...")
         # Extract results from function call arguments BEFORE submitting tool outputs
         results = extract_results_from_requires_action(run_data)
-        
+
         if results.length > 0
           add_log('info', "Found #{results.length} results from requires_action, submitting tool outputs...")
           # Submit tool outputs to acknowledge the function call
           submit_tool_outputs(thread_id, run_id, run_data)
-          
+
           # CRITICAL: Wait for run to fully complete before returning
           # This prevents "Can't add messages while run is active" error on next batch
           # After tool outputs, we MUST wait for 'completed' status only (not 'requires_action')
+          # Usage is only populated when run is in terminal state; at requires_action it was nil
           add_log('info', "Waiting for run to fully complete after tool outputs submission...")
-          wait_for_run_to_fully_complete(thread_id, run_id, timeout: 120)
+          completed_run_data = wait_for_run_to_fully_complete(thread_id, run_id, timeout: 120)
+          batch_usage = extract_usage_from_run(completed_run_data) if completed_run_data
           add_log('info', "Run fully completed, safe to proceed to next batch")
-          
-          # Results are already extracted, return them
+
+          # Results are already extracted, return them with usage from completed run
           return {
             results: results,
-            thread_id: thread_id
+            thread_id: thread_id,
+            usage: batch_usage
           }
         else
           add_log('warn', "No results found in requires_action, submitting tool outputs and checking messages...")
           submit_tool_outputs(thread_id, run_id, run_data)
           # Wait for FULL completion after submitting tool outputs (must be 'completed', not 'requires_action')
           run_data = wait_for_run_to_fully_complete(thread_id, run_id, timeout: 420)
+          batch_usage = extract_usage_from_run(run_data)
         end
       end
-      
+
       # Step 5: Process results (for completed runs)
       results = process_checklist_response(thread_id, run_data, checklist_items)
       
@@ -262,12 +317,12 @@ class OpenaiService
         # This is a warning but not a failure - we'll use what we got
       end
       
-      # Return BOTH results and thread_id
+      # Return results, thread_id, and usage for analytics
       {
         results: results,
-        thread_id: thread_id
+        thread_id: thread_id,
+        usage: batch_usage
       }
-      
     rescue => e
       add_log('error', "Batch Analysis Failed: #{e.message}")
       add_log('error', "Error class: #{e.class}")

@@ -7,6 +7,7 @@ class Evaluation < ApplicationRecord
   
   has_many :evaluation_checklist_items, dependent: :destroy
   has_many :checklist_items, through: :evaluation_checklist_items
+  has_many :token_usages, dependent: :nullify
 
   # Validations
   validates :user_id, presence: true

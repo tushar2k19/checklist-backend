@@ -4,6 +4,7 @@ class User < ApplicationRecord
   # Associations
   has_many :uploaded_files, dependent: :destroy
   has_many :evaluations, dependent: :destroy
+  has_many :token_usages, dependent: :nullify
 
   # Validations
   validates :email, presence: true, uniqueness: true, format: { with: URI::MailTo::EMAIL_REGEXP }

@@ -110,11 +110,11 @@ module Api
         processing_time = (Time.zone.now - start_time).to_i
         logs = analysis_response[:logs] || ""
         
-        # 5. Store results
+        # 5. Store results and token usage for analytics
         ActiveRecord::Base.transaction do
           results.each do |result|
             matched_item = checklist_items.values.find { |i| i.item_text == result['item'] }
-            
+
             if matched_item
               evaluation.evaluation_checklist_items.create!(
                 checklist_item: matched_item,
@@ -123,10 +123,22 @@ module Api
               )
             end
           end
-          
+
           # 6. Mark as completed with thread_id
           evaluation.mark_as_completed!(thread_id, processing_time, results)
-          
+
+          # 7. Persist token usage for admin analytics
+          eval_in = analysis_response[:evaluation_input_tokens].to_i
+          eval_out = analysis_response[:evaluation_output_tokens].to_i
+          if eval_in.positive? || eval_out.positive?
+            TokenUsage.record_evaluation!(
+              user_id: current_user.id,
+              evaluation_id: evaluation.id,
+              input_tokens: eval_in,
+              output_tokens: eval_out
+            )
+          end
+
           # Update file last analyzed
           uploaded_file.touch(:last_analyzed_at)
         end

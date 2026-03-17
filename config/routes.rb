@@ -20,7 +20,18 @@ Rails.application.routes.draw do
     resources :document_types, only: [:index]
     
     # Checklist Templates
-    resources :checklist_templates, only: [:index]
+    resources :checklist_templates, only: [:index] do
+      collection do
+        patch :reorder
+        post :sync
+      end
+    end
+
+    # Checklist Items (CRUD)
+    resources :checklist_items, only: [:create, :update]
+
+    # Checklist Item Assignments (remove from scheme)
+    resources :checklist_item_assignments, only: [:destroy]
     
     # Evaluations
     resources :evaluations, only: [:index, :create, :show, :destroy] do
@@ -28,7 +39,13 @@ Rails.application.routes.draw do
                 only: [:create, :show],
                 controller: 'evaluations/followup_questions'
     end
-    
+
+    # Admin-only: token usage analytics
+    get 'token_usage_analytics', to: 'token_usage_analytics#index'
+
+    # Passwords (change password)
+    patch 'passwords', to: 'passwords#update'
+
     # Legacy/Deprecated (to be removed)
     post 'checklist/analyze', to: 'checklist#analyze'
     get 'checklist/defaults', to: 'checklist#defaults'
