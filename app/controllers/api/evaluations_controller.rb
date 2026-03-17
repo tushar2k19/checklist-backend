@@ -85,10 +85,18 @@ module Api
         status: 'pending'
       )
       
-      # 3. Get checklist items
+      # 3. Get checklist items (support optional item_text overrides from Editor's Items)
       checklist_items = ChecklistItem.where(id: item_ids).index_by(&:id)
-      checklist_texts = item_ids.map { |id| checklist_items[id]&.item_text }.compact
-      
+      overrides = (params[:checklist_item_overrides] || {}).stringify_keys
+      checklist_texts = item_ids.map { |id| overrides[id.to_s].presence || checklist_items[id]&.item_text }.compact
+      text_to_item = {}
+      item_ids.each do |id|
+        item = checklist_items[id]
+        next unless item
+        text = overrides[id.to_s].presence || item.item_text
+        text_to_item[text] = item
+      end
+
       if checklist_texts.empty?
         evaluation.mark_as_failed!("No valid checklist items found")
         return render_error("validation_error", "Invalid checklist items", status: :unprocessable_entity)
@@ -109,11 +117,13 @@ module Api
         thread_id = analysis_response[:thread_id]
         processing_time = (Time.zone.now - start_time).to_i
         logs = analysis_response[:logs] || ""
+
+        Rails.logger.info "Evaluation #{evaluation.id}: OpenAI analysis completed (thread_id=#{thread_id}, results=#{results.is_a?(Array) ? results.length : 'n/a'})"
         
         # 5. Store results and token usage for analytics
         ActiveRecord::Base.transaction do
           results.each do |result|
-            matched_item = checklist_items.values.find { |i| i.item_text == result['item'] }
+            matched_item = text_to_item[result['item']] || checklist_items.values.find { |i| i.item_text == result['item'] }
 
             if matched_item
               evaluation.evaluation_checklist_items.create!(

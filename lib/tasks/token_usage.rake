@@ -2,7 +2,7 @@
 # Usage: rails token_usage:run
 # Or with specific file: FILE_ID=123 rails token_usage:run
 namespace :token_usage do
-  desc "Run evaluation and capture token usage (16 items, 6 batches)"
+  desc "Run evaluation and capture token usage (two-pass)"
   task run: :environment do
     scheme = Scheme.find_by(name: "New SDPs") || Scheme.first
     doc_type = DocumentType.find_by(name: "dpr") || DocumentType.first
@@ -22,7 +22,7 @@ namespace :token_usage do
     puts "=== Token Usage Test ==="
     puts "Scheme: #{scheme.name}, DocType: #{doc_type.name}"
     puts "File: #{file.original_filename} (#{file.file_size_bytes / 1_000_000.0} MB)"
-    puts "Checklist items: #{checklist_texts.length} (batches of 3 = #{((checklist_texts.length + 2) / 3)} batches)"
+    puts "Checklist items: #{checklist_texts.length}"
     puts ""
 
     log_accumulator = []

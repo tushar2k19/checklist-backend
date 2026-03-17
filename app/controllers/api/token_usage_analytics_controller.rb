@@ -14,6 +14,7 @@ module Api
       end
 
       analytics = TokenUsage.analytics(since_time: since_time)
+      per_evaluation = TokenUsage.per_evaluation_breakdown(since_time: since_time)
 
       render_success(
         {
@@ -26,6 +27,7 @@ module Api
           total_followup_tokens: analytics[:total_followup_tokens],
           evaluations_count: analytics[:evaluations_count],
           followup_events_count: analytics[:followup_events_count],
+          per_evaluation: per_evaluation,
           since_days: params[:since_days].presence&.to_i
         },
         message: 'Token usage analytics retrieved successfully'

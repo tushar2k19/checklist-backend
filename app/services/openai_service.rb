@@ -3,6 +3,8 @@ class OpenaiService
   
   # Base configuration
   base_uri 'https://api.openai.com/v1'
+
+  REWRITE_BATCH_SIZE = 10
   
   def initialize(log_accumulator: nil)
     @api_key = ENV['OPENAI_API_KEY']
@@ -63,10 +65,14 @@ class OpenaiService
   end
 
   # Analyze a checklist against a specific file (using vector store)
-  # Supports batch processing for better accuracy (processes 3 items at a time)
+  # Two-pass strategy:
+  # - Pass 1 (retrieval): use file_search to produce status + structured facts
+  # - Pass 2 (rewrite): no file_search; convert structured facts into concise final remarks
+  #
+  # Supports batch processing for better accuracy (defaults to 3 items per batch)
   # Uses SINGLE THREAD for entire evaluation to avoid concurrency issues
   # Includes robust retry logic for failed batches
-  def analyze_checklist(uploaded_file_id: nil, vector_store_id:, checklist_items:, batch_size: 3)
+  def analyze_checklist(uploaded_file_id: nil, vector_store_id:, checklist_items:, batch_size: 5)
     add_log('info', "=== Starting Checklist Analysis ===")
     add_log('info', "Total items: #{checklist_items.length}, Batch size: #{batch_size}")
     
@@ -74,36 +80,48 @@ class OpenaiService
     thread_id = create_thread(vector_store_id)
     add_log('info', "Created single thread #{thread_id} for entire evaluation")
     
-    # For small lists (<=3 items), process normally with retry
-    if checklist_items.length <= batch_size
-      Rails.logger.info "Processing all items in single batch"
-      single = analyze_checklist_batch_with_retry(thread_id, checklist_items, 1, 1)
-      u = single[:usage]
-      return single.merge(
-        evaluation_input_tokens: u&.dig(:input_tokens).to_i,
-        evaluation_output_tokens: u&.dig(:output_tokens).to_i
-      )
-    end
+    # Pass 1 (retrieval) - batched, same thread
+    add_log('info', "=== Pass 1: retrieval + structured facts ===")
+    pass1_results, pass1_input, pass1_output = analyze_checklist_pass1(
+      thread_id: thread_id,
+      checklist_items: checklist_items,
+      batch_size: batch_size
+    )
 
-    # Batch processing for larger lists with retry logic (using SAME thread)
-    all_results = []
+    # Pass 2 (rewrite) - no file_search, rewrite Pass 1 into final concise remarks
+    add_log('info', "=== Pass 2: rewrite to final concise remarks (no file_search) ===")
+    pass2_results, pass2_input, pass2_output = rewrite_results_pass2(
+      pass1_results: pass1_results
+    )
+
+    {
+      results: pass2_results,
+      thread_id: thread_id,
+      evaluation_input_tokens: (pass1_input + pass2_input),
+      evaluation_output_tokens: (pass1_output + pass2_output)
+    }
+  end
+
+  def analyze_checklist_pass1(thread_id:, checklist_items:, batch_size:)
     total_input = 0
     total_output = 0
+    all_results = []
+
     batches = checklist_items.each_slice(batch_size).to_a
     total_batches = batches.length
 
     batches.each_with_index do |batch_items, batch_index|
       batch_num = batch_index + 1
-      add_log('info', "Processing batch #{batch_num}/#{total_batches} (#{batch_items.length} items) on thread #{thread_id}")
+      add_log('info', "[PASS1] Processing batch #{batch_num}/#{total_batches} (#{batch_items.length} items) on thread #{thread_id}")
 
       begin
-        # Process batch with retry logic (reusing same thread)
         batch_result = analyze_checklist_batch_with_retry(
           thread_id,
           batch_items,
           batch_num,
           total_batches,
-          max_retries: 3
+          max_retries: 3,
+          pass_label: 'PASS1'
         )
         all_results.concat(batch_result[:results])
         u = batch_result[:usage]
@@ -112,33 +130,73 @@ class OpenaiService
           total_output += u[:output_tokens].to_i
         end
 
-        # Longer delay between batches for large files (5 seconds)
         if batch_index < batches.length - 1
-          add_log('info', "Waiting 5 seconds before next batch (allows OpenAI to process large file)...")
+          add_log('info', "[PASS1] Waiting 5 seconds before next batch...")
           sleep 5
         end
       rescue => e
-        add_log('error', "Batch #{batch_num} failed after all retries: #{e.message}")
-        add_log('error', "Error class: #{e.class}, Backtrace: #{e.backtrace.first(3).join(', ')}")
+        add_log('error', "[PASS1] Batch #{batch_num} failed after all retries: #{e.message}")
+        add_log('error', "[PASS1] Error class: #{e.class}, Backtrace: #{e.backtrace.first(3).join(', ')}")
 
-        # Create placeholder results for failed batch items
         batch_items.each do |item|
           all_results << {
             'item' => item,
             'status' => 'No',
-            'remarks' => "Analysis failed for this item after multiple retry attempts: #{e.message}"
+            'key_points' => [],
+            'location_hints' => [],
+            'missing_points' => [],
+            'not_found_reason' => "Pass 1 failed after multiple retries: #{e.message}",
+            'remarks' => ''
           }
         end
       end
     end
 
-    # Return combined results with the single thread_id and accumulated token usage
-    {
-      results: all_results,
-      thread_id: thread_id,
-      evaluation_input_tokens: total_input,
-      evaluation_output_tokens: total_output
-    }
+    [all_results, total_input, total_output]
+  end
+
+  def rewrite_results_pass2(pass1_results:)
+    # Chunk pass1 results to keep prompts bounded; rewrite is cheap but can still be large.
+    total_input = 0
+    total_output = 0
+    final_results = []
+
+    rewrite_thread_id = create_thread(nil)
+    chunks = pass1_results.each_slice(REWRITE_BATCH_SIZE).to_a
+    total_chunks = chunks.length
+
+    chunks.each_with_index do |chunk, idx|
+      chunk_num = idx + 1
+      add_log('info', "[PASS2] Rewriting chunk #{chunk_num}/#{total_chunks} (#{chunk.length} items) on thread #{rewrite_thread_id}")
+
+      prompt = build_rewrite_prompt(chunk, chunk_num, total_chunks)
+      send_message(rewrite_thread_id, prompt)
+      run_id = create_rewrite_run(rewrite_thread_id)
+      run_data = wait_for_run_completion(rewrite_thread_id, run_id, timeout: 180)
+      log_run_usage(run_data, "PASS2 chunk #{chunk_num}/#{total_chunks}")
+      usage = extract_usage_from_run(run_data)
+
+      # Handle requires_action for rewrite run
+      if run_data['status'] == 'requires_action'
+        results = extract_results_from_requires_action(run_data)
+        add_log('info', "[PASS2] requires_action: extracted #{results.length} results from function call args")
+        submit_tool_outputs(rewrite_thread_id, run_id, run_data)
+        completed_run_data = wait_for_run_to_fully_complete(rewrite_thread_id, run_id, timeout: 180)
+        log_run_usage(completed_run_data, "PASS2 chunk #{chunk_num}/#{total_chunks} (after tool outputs)")
+        usage = extract_usage_from_run(completed_run_data) if completed_run_data
+        final_results.concat(results)
+      else
+        results = process_checklist_response(rewrite_thread_id, run_data, chunk.map { |r| r['item'] })
+        final_results.concat(results)
+      end
+
+      if usage
+        total_input += usage[:input_tokens].to_i
+        total_output += usage[:output_tokens].to_i
+      end
+    end
+
+    [final_results, total_input, total_output]
   end
 
   # Ask a follow-up question on a checklist item using a dedicated assistant.
@@ -199,37 +257,38 @@ class OpenaiService
   
   # Analyze a single batch with retry logic
   # Now accepts thread_id instead of vector_store_id to reuse same thread
-  def analyze_checklist_batch_with_retry(thread_id, checklist_items, batch_num, total_batches, max_retries: 3)
+  def analyze_checklist_batch_with_retry(thread_id, checklist_items, batch_num, total_batches, max_retries: 3, pass_label: nil)
     attempt = 0
     last_error = nil
     
     while attempt < max_retries
       attempt += 1
       begin
-        add_log('info', "Batch #{batch_num}: Attempt #{attempt}/#{max_retries} on thread #{thread_id}")
+        prefix = pass_label ? "[#{pass_label}] " : ""
+        add_log('info', "#{prefix}Batch #{batch_num}: Attempt #{attempt}/#{max_retries} on thread #{thread_id}")
         
         batch_result = analyze_checklist_batch(thread_id, checklist_items, batch_num, total_batches)
         
-        add_log('info', "Batch #{batch_num}: Successfully completed on attempt #{attempt}")
+        add_log('info', "#{prefix}Batch #{batch_num}: Successfully completed on attempt #{attempt}")
         return batch_result
         
       rescue => e
         last_error = e
         is_retryable = is_retryable_error?(e)
         
-        add_log('warn', "Batch #{batch_num}: Attempt #{attempt} failed: #{e.message}")
-        add_log('warn', "Error class: #{e.class}, Retryable: #{is_retryable}")
+        add_log('warn', "#{prefix}Batch #{batch_num}: Attempt #{attempt} failed: #{e.message}")
+        add_log('warn', "#{prefix}Error class: #{e.class}, Retryable: #{is_retryable}")
         
         if attempt < max_retries && is_retryable
           # Longer backoff for large file processing: 10s, 20s, 40s (capped at 45s)
           wait_time = [10 * (2 ** (attempt - 1)), 45].min
-          add_log('warn', "Batch #{batch_num}: Retrying in #{wait_time}s... (attempt #{attempt + 1}/#{max_retries})")
+          add_log('warn', "#{prefix}Batch #{batch_num}: Retrying in #{wait_time}s... (attempt #{attempt + 1}/#{max_retries})")
           sleep wait_time
         else
           if !is_retryable
-            add_log('error', "Batch #{batch_num}: Non-retryable error, stopping retries")
+            add_log('error', "#{prefix}Batch #{batch_num}: Non-retryable error, stopping retries")
           else
-            add_log('error', "Batch #{batch_num}: Max retries (#{max_retries}) reached")
+            add_log('error', "#{prefix}Batch #{batch_num}: Max retries (#{max_retries}) reached")
           end
           raise e
         end
@@ -275,7 +334,10 @@ class OpenaiService
           # After tool outputs, we MUST wait for 'completed' status only (not 'requires_action')
           # Usage is only populated when run is in terminal state; at requires_action it was nil
           add_log('info', "Waiting for run to fully complete after tool outputs submission...")
-          completed_run_data = wait_for_run_to_fully_complete(thread_id, run_id, timeout: 120)
+          # Some runs can take longer to transition from requires_action -> completed after tool output submission.
+          # Keep this bounded; if it times out we will cancel the run to unblock the thread before retrying.
+          completed_run_data = wait_for_run_to_fully_complete(thread_id, run_id, timeout: 180)
+          log_run_usage(completed_run_data, "Batch #{batch_num}/#{total_batches} (after tool outputs)")
           batch_usage = extract_usage_from_run(completed_run_data) if completed_run_data
           add_log('info', "Run fully completed, safe to proceed to next batch")
 
@@ -290,6 +352,7 @@ class OpenaiService
           submit_tool_outputs(thread_id, run_id, run_data)
           # Wait for FULL completion after submitting tool outputs (must be 'completed', not 'requires_action')
           run_data = wait_for_run_to_fully_complete(thread_id, run_id, timeout: 420)
+          log_run_usage(run_data, "Batch #{batch_num}/#{total_batches} (after tool outputs)")
           batch_usage = extract_usage_from_run(run_data)
         end
       end
@@ -326,6 +389,16 @@ class OpenaiService
     rescue => e
       add_log('error', "Batch Analysis Failed: #{e.message}")
       add_log('error', "Error class: #{e.class}")
+      # If we timed out, try to cancel the active run so the thread is not stuck in "run active" state.
+      # This prevents subsequent retries from failing with "Can't add messages while a run is active."
+      if e.message.to_s.downcase.include?('timed out') && defined?(run_id) && run_id
+        begin
+          add_log('warn', "Attempting to cancel run #{run_id} after timeout...")
+          cancel_run(thread_id, run_id)
+        rescue => cancel_err
+          add_log('warn', "Failed to cancel run #{run_id}: #{cancel_err.message}")
+        end
+      end
       raise e
     end
   end
@@ -530,47 +603,52 @@ class OpenaiService
   
   def build_checklist_prompt(checklist_items, batch_num = nil, total_batches = nil)
     items_list = checklist_items.map.with_index(1) { |item, i| "#{i}. #{item}" }.join("\n")
-    batch_info = batch_num && total_batches ? "\n\nBATCH INFORMATION: This is batch #{batch_num} of #{total_batches}. Analyze only the items listed below for this batch." : ""
+    batch_info = batch_num && total_batches ? "\nBATCH: #{batch_num} of #{total_batches}." : ""
     
     <<~PROMPT
-      You are a specialized DPR (Detailed Project Report) Compliance Auditor with expertise in government project documentation.
-      
-      CORE RULES (STRICT ADHERENCE REQUIRED):
-      1. Your analysis MUST be based ONLY on the document provided in the vector store for this thread. Do NOT use any external or prior knowledge.
-      2. You MUST thoroughly search the document EXTENSIVELY for EACH checklist item to retrieve all relevant information.
-      3. Search thoroughly: Information may be in different sections, pages, or use different terminology. Explore all relevant keywords and synonyms.
-      4. Explicitly ignore all previous knowledge of state projects or other DPRs. If your response contains information not found in the current document, you MUST state so clearly in the remarks.
-      5. If the document is a general document (e.g., proposal, random PDF) and not a valid DPR, mark all items as "No" and state "Document is not a valid DPR" in the remarks for each item.
-      6. When in doubt about whether information exists, perform additional searches using different keywords related to the checklist item to confirm its presence or absence.
-#{batch_info}
-      
-      CHECKLIST FOR EVALUATION (Analyze ALL items below):
+      PASS 1 (Retrieval): Evaluate ONLY the checklist items listed below for this batch, using ONLY the document available in this thread's vector store.
+      #{batch_info}
+
+      CHECKLIST ITEMS (analyze all):
       #{items_list}
 
-      CRITICAL SEARCH INSTRUCTIONS (For EACH checklist item):
-      - Thoroughly search the document for relevant information.
-      - Search using the exact item text AND related keywords/synonyms.
-      - Explicitly check multiple sections of the document, as information may be spread across different pages.
-      - Look for partial matches; sometimes, information exists but uses different terminology.
-      - Only mark as "No" if you have exhaustively searched and confirmed the information is truly missing from the provided document.
+      For each item:
+      - Decide status: Yes / Partial / No
+      - Do NOT write long prose. Instead, return structured fields:
+        - key_points: 2-5 concise factual bullets grounded in the document
+        - location_hints: page/section/chapter hints when available
+        - missing_points (Partial only): what is missing
+        - not_found_reason (No only): concise reason
+      - Before marking "No", try at least 2 distinct keyword/synonym searches for that item.
+      - Do NOT include quotes. Do NOT mention file_search.
 
-      STATUS EVALUATION GUIDELINES:
-      - "Yes": The item is fully addressed, with all required information clearly present and verifiable within the provided document.
-      - "Partial": The item is partially addressed – some information exists, but crucial aspects are missing or incomplete within the provided document.
-      - "No": After thorough and exhaustive searching, the required information is conclusively not found in the provided document.
+      MANDATORY: Return ONLY via the 'return_checklist_results' function (no conversational text).
+    PROMPT
+  end
 
-      INSTRUCTIONS FOR REMARKS (Multi-Angle - Provide specific details/citations from the document):
-      - If "Yes": Provide a comprehensive (100+ words) technical summary. Explicitly mention specific values, departments, dates, or page references found in the text. Clearly cite where the information appears within the document.
-      - If "Partial": Clearly articulate what information IS present and what specific aspects are MISSING. Explain why the item is considered incomplete based *only* on the provided document.
-      - If "No": After confirming an exhaustive search, explicitly state: "Information regarding [Item] was not found in the provided document after extensive and thorough review."
+  def build_rewrite_prompt(pass1_chunk, chunk_num, total_chunks)
+    payload = JSON.pretty_generate({ results: pass1_chunk })
+    <<~PROMPT
+      PASS 2 (Rewrite): Convert the structured Pass 1 results into final readable remarks for the UI (Markdown format).
+      CHUNK: #{chunk_num} of #{total_chunks}.
 
-      EXAMPLES OF QUALITY ANALYSIS:
-      - Angle 1 (Technical/Financial): "Yes. The report (page 12) specifies a total project cost of ₹45.6 Cr, with a clear breakdown into Civil (₹30Cr) and Electrical (₹15.6Cr) components. Implementation is scheduled over 18 months, with quarterly milestones detailed in section 4.2 of the DPR."
-      - Angle 2 (Administrative/Compliance): "Partial. The document (chapter 3) mentions environmental impact assessment and forest clearance procedures. However, the specific 'No Objection Certificate' from the State Forest Department, mandatory as per guidelines section 5.2, is explicitly missing from the provided document."
-      - Angle 3 (Strategic/Rationale): "No. After extensive searching the document, information regarding the specific intended beneficiaries and their identification process was not found in the provided document."
+      Requirements:
+      - Output MUST be visually readable in a plain-text UI (newlines preserved).
+      - Each bullet MUST be on its own line (use newline characters).
+      - If you include multiple points, NEVER put them on one line separated by semicolons.
+      - Prefer 2-6 bullets max.
+      - Highlight key terms/numbers/amounts/keywords/locations (and other important information) by wrapping them in **double-asterisks** (e.g. **₹12.5 Cr**, **3 months**, **10%**, **Missing**, **Provided**, **Year 1**, **Month 24**, **page 23**, **MHA**, **NESIDS**, **Mizoram**, **North-East**, **Nagaland**, etc ).
+      - If status is No: include a single-line reason (can be 1-2 bullets), don't over-explain.
+      - Do NOT use file_search or any external knowledge.
+      - Do NOT add evidence quotes. Only include location hints if present.
+      - Keep status unchanged.
 
-      MANDATORY: You MUST return your findings by calling the 'return_checklist_results' function. Ensure you analyze ALL items in the checklist above, strictly adhering to the document provided. Your responses MUST ONLY reflect information found in the CURRENT document.
-       PROMPT
+      Input (Pass 1 structured results JSON):
+      #{payload}
+
+      Output:
+      Return ONLY via return_checklist_results with results[] containing: item, status, remarks.
+    PROMPT
   end
   
   def create_checklist_run(thread_id)
@@ -593,9 +671,14 @@ class OpenaiService
                       properties: {
                       item: { type: "string" },
                       status: { type: "string", enum: ["Yes", "No", "Partial"] },
-                      remarks: { type: "string" }
+                      # Pass 1 can return structured fields; Pass 2 returns only remarks.
+                      remarks: { type: "string" },
+                      key_points: { type: "array", items: { type: "string" } },
+                      location_hints: { type: "array", items: { type: "string" } },
+                      missing_points: { type: "array", items: { type: "string" } },
+                      not_found_reason: { type: "string" }
                       },
-                      required: ["item", "status", "remarks"]
+                      required: ["item", "status"]
                     }
                   }
                 },
@@ -606,6 +689,42 @@ class OpenaiService
         ]
       }
       
+    response = self.class.post("/threads/#{thread_id}/runs", headers: @headers, body: payload.to_json)
+    handle_response(response)['id']
+  end
+
+  def create_rewrite_run(thread_id)
+    payload = {
+      assistant_id: @assistant_id,
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "return_checklist_results",
+            description: "Return rewritten checklist results",
+            parameters: {
+              type: "object",
+              properties: {
+                results: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      item: { type: "string" },
+                      status: { type: "string", enum: ["Yes", "No", "Partial"] },
+                      remarks: { type: "string" }
+                    },
+                    required: ["item", "status", "remarks"]
+                  }
+                }
+              },
+              required: ["results"]
+            }
+          }
+        }
+      ]
+    }
+
     response = self.class.post("/threads/#{thread_id}/runs", headers: @headers, body: payload.to_json)
     handle_response(response)['id']
   end
@@ -667,9 +786,15 @@ class OpenaiService
   
   # Wait for run to FULLY complete - ONLY returns on 'completed' status
   # Used after submitting tool outputs to ensure run is completely done
-  def wait_for_run_to_fully_complete(thread_id, run_id, timeout: 120)
+  # Wait for run to FULLY complete - ONLY returns on 'completed' status
+  # Used after submitting tool outputs to ensure run is completely done.
+  #
+  # NOTE: Some runs can take time to transition from requires_action -> completed,
+  # especially on large PDFs with heavy file_search. Keep this bounded; callers may cancel on timeout.
+  def wait_for_run_to_fully_complete(thread_id, run_id, timeout: 180)
     start_time = Time.zone.now
     check_interval = 2 # Check every 2 seconds
+    last_resubmit_at = nil
     
     loop do
       elapsed = Time.zone.now - start_time
@@ -687,6 +812,23 @@ class OpenaiService
         if status == 'completed'
           add_log('info', "Run #{run_id} fully completed")
           return run_data
+        end
+
+        # If OpenAI keeps the run in requires_action after tool output submission, re-submit tool outputs
+        # idempotently to help the run transition. This addresses intermittent stuck requires_action runs.
+        if status == 'requires_action'
+          now = Time.zone.now
+          should_resubmit = last_resubmit_at.nil? || (now - last_resubmit_at) >= 15
+          if should_resubmit
+            begin
+              add_log('warn', "Run #{run_id} still requires_action; re-submitting tool outputs to unblock (elapsed: #{elapsed.round}s)")
+              submit_tool_outputs(thread_id, run_id, run_data)
+              last_resubmit_at = now
+            rescue => resubmit_err
+              add_log('warn', "Re-submit tool outputs failed for run #{run_id}: #{resubmit_err.message}")
+              last_resubmit_at = now
+            end
+          end
         end
         
         if ['failed', 'cancelled', 'expired'].include?(status)
@@ -722,6 +864,12 @@ class OpenaiService
         sleep check_interval
       end
     end
+  end
+
+  # Cancel an active run to unblock a thread.
+  def cancel_run(thread_id, run_id)
+    response = self.class.post("/threads/#{thread_id}/runs/#{run_id}/cancel", headers: @headers)
+    handle_response(response)
   end
   
   def extract_results_from_requires_action(run_data)
@@ -787,9 +935,29 @@ class OpenaiService
       end
     end
     
-    # If we still have no results, log warning and return empty
+    # If we still have no results, attempt to parse plain JSON text fallback.
     add_log('warn', "No results found in messages. Run status: #{run_data['status']}")
+    plain_text = extract_plain_text_response(thread_id)
+    parsed = parse_results_from_plain_json(plain_text)
+    return parsed if parsed.any?
     []
+  end
+
+  def parse_results_from_plain_json(text)
+    return [] if text.blank?
+    trimmed = text.to_s.strip
+    return [] unless trimmed.start_with?('{') || trimmed.start_with?('[')
+
+    begin
+      parsed = JSON.parse(trimmed)
+      if parsed.is_a?(Hash) && parsed['results'].is_a?(Array)
+        add_log('warn', "Parsed results from plain JSON text fallback")
+        return parsed['results']
+      end
+      []
+    rescue JSON::ParserError
+      []
+    end
   end
   
   # Extract results from thread messages (for completed runs)

@@ -59,26 +59,79 @@ common_items.each do |text|
   checklist_item_objects << ChecklistItem.create!(item_text: text)
 end
 
+# PM-DevINE DPR checklist (33 items) – Ref. Para 9.5 of the Guidelines
+# See docs/PM_DEVINE_DPR_CHECKLIST.md
+pm_devine_dpr_items = [
+  "Approval of Concept Note from MDONER (Minutes of EIMC)",
+  "Compliance with the comments (if any) of the concerned line department and conditions specified by EIMC (if any) at time of selection of project",
+  "Endorsement of DPR by SLEC and submission of project proposal to MDONER (minutes of SLEC to be enclosed)",
+  "Project Profile",
+  "Expected beneficiaries and socioeconomic impact",
+  "Alignment of proposed project with the focus areas indicated under the scheme guidelines",
+  "Timeline for implementation",
+  "Structured roadmap covering approvals, construction, and operational phase including contingencies via PERT Charts",
+  "Sustainability Plan",
+  "Use of energy efficient solutions for sustainability",
+  "Mechanism for O&M (after project completion)",
+  "O&M Mechanism identifying responsible agencies",
+  "Financial Plan for operational sustainability (Ownership, revenue model, and operational responsibilities post MDONER funding period.)",
+  "Cost Estimates, clearly indicating the basis for unit costs",
+  "All Sources of funding for the project (Mandatory disclosure on whether Private Investment or PPP has been explored; if feasible, a plan for leveraging VGF/co-funding mechanisms should be detailed)",
+  "Location(s) of project with geo-coordinates",
+  "Satellite image / photograph of project site with GIS based accessibility study for evaluation of connectivity",
+  "Alignment with Gati Shakti Master Plan to demonstrate convergence",
+  "Compliance with guidelines of concerned line department",
+  "Output-Outcome framework with KPIs for monitoring the project to be provided as per the sectoral indicators mentioned under Point C of Annexure E of the Guidelines",
+  "Provision for project evaluation(s)",
+  "Report of the institute of repute on the techno-economic vetting of DPR, along with the Executive Summary of the DPR",
+  "Statutory Clearances, as applicable: Forest & Environment",
+  "Statutory Clearances, as applicable: Town and Country Planning",
+  "Statutory Clearances, as applicable: Industries",
+  "Availability of encumbrance-free land for the project",
+  "Certification that costs proposed is as per the latest applicable Schedule of Rates",
+  "Non-duplication Certificate, duly endorsed to the concerned line department in the States, and concerned line Ministry at the Centre, within whose purview the project falls",
+  "Identification of Risks and Mitigation Measures: Technical Risks",
+  "Identification of Risks and Mitigation Measures: Administrative Risk",
+  "Identification of Risks and Mitigation Measures: Environmental Risk",
+  "Identification of Risks and Mitigation Measures: Risk due to natural disaster",
+  "Identification of Risks and Mitigation Measures: Operational Risk"
+]
+pm_devine_dpr_objects = pm_devine_dpr_items.map { |text| ChecklistItem.create!(item_text: text) }
+
 puts "Seeding Template Assignments..."
-# For demonstration, assign all common items to all schemes + dpr
-# In reality, this would be more granular based on specific scheme requirements
+# PM-DevINE uses dedicated 33-item DPR checklist; other schemes use common items.
+# Concept Note for all schemes uses first 5 common items.
 
 dpr_type = DocumentType.find_by(name: 'dpr')
 concept_note_type = DocumentType.find_by(name: 'concept_note')
+pm_devine_scheme = Scheme.find_by(name: 'PM-DevINE')
 
 Scheme.all.each do |scheme|
-  # Assign to DPR
-  checklist_item_objects.each_with_index do |item, index|
-    ChecklistItemSchemeAssignment.create!(
-      checklist_item: item,
-      scheme: scheme,
-      document_type: dpr_type,
-      display_order: index + 1,
-      is_active: true
-    )
+  if scheme.id == pm_devine_scheme.id
+    # PM-DevINE + DPR: 33 dedicated checklist items
+    pm_devine_dpr_objects.each_with_index do |item, index|
+      ChecklistItemSchemeAssignment.create!(
+        checklist_item: item,
+        scheme: scheme,
+        document_type: dpr_type,
+        display_order: index + 1,
+        is_active: true
+      )
+    end
+  else
+    # Other schemes + DPR: common items
+    checklist_item_objects.each_with_index do |item, index|
+      ChecklistItemSchemeAssignment.create!(
+        checklist_item: item,
+        scheme: scheme,
+        document_type: dpr_type,
+        display_order: index + 1,
+        is_active: true
+      )
+    end
   end
-  
-  # Assign first 5 items to Concept Note (simpler checklist)
+
+  # Concept Note: first 5 common items for all schemes (including PM-DevINE)
   checklist_item_objects.take(5).each_with_index do |item, index|
     ChecklistItemSchemeAssignment.create!(
       checklist_item: item,

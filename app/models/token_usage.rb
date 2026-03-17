@@ -61,4 +61,64 @@ class TokenUsage < ApplicationRecord
       followup_events_count: rel.followup.count
     }
   end
+
+  # Per-evaluation breakdown for "per document costs" UI.
+  # Returns an array of hashes keyed by evaluation_id with both evaluation and follow-up token usage.
+  def self.per_evaluation_breakdown(since_time: nil)
+    rel = where.not(evaluation_id: nil)
+    rel = rel.since(since_time) if since_time.present?
+
+    usage_by_eval_and_source = rel
+      .group(:evaluation_id, :source)
+      .pluck(
+        :evaluation_id,
+        :source,
+        Arel.sql('COALESCE(SUM(input_tokens), 0)'),
+        Arel.sql('COALESCE(SUM(output_tokens), 0)'),
+        Arel.sql('COALESCE(SUM(total_tokens), 0)')
+      )
+
+    eval_ids = usage_by_eval_and_source.map { |row| row[0] }.uniq
+    evaluations_by_id = Evaluation
+      .includes(:uploaded_file, :scheme, :document_type)
+      .where(id: eval_ids)
+      .index_by(&:id)
+
+    acc = Hash.new do |h, eval_id|
+      h[eval_id] = {
+        evaluation_id: eval_id,
+        evaluation_input: 0,
+        evaluation_output: 0,
+        evaluation_total: 0,
+        followup_input: 0,
+        followup_output: 0,
+        followup_total: 0
+      }
+    end
+
+    usage_by_eval_and_source.each do |evaluation_id, source, input_sum, output_sum, total_sum|
+      row = acc[evaluation_id]
+      if source == SOURCE_EVALUATION
+        row[:evaluation_input] = input_sum.to_i
+        row[:evaluation_output] = output_sum.to_i
+        row[:evaluation_total] = total_sum.to_i
+      elsif source == SOURCE_FOLLOWUP
+        row[:followup_input] = input_sum.to_i
+        row[:followup_output] = output_sum.to_i
+        row[:followup_total] = total_sum.to_i
+      end
+    end
+
+    acc.values.map do |row|
+      ev = evaluations_by_id[row[:evaluation_id]]
+      row.merge(
+        evaluation_created_at: ev&.created_at&.iso8601,
+        evaluation_status: ev&.status,
+        scheme_name: ev&.scheme&.name,
+        document_type_name: ev&.document_type&.name,
+        file_name: ev&.uploaded_file&.display_name || ev&.uploaded_file&.original_filename,
+        total_tokens: row[:evaluation_total].to_i + row[:followup_total].to_i
+      )
+    end.sort_by { |r| r[:evaluation_created_at].to_s }.reverse
+  end
 end
