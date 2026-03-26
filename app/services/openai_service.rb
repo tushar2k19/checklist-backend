@@ -8,9 +8,12 @@ class OpenaiService
   
   def initialize(log_accumulator: nil)
     @api_key = ENV['OPENAI_API_KEY']
+    # Assistant ID for the primary checklist evaluation workflow (Assistants API).
     @assistant_id = ENV['Checklist_ASSISTANT_ID']
     # Use dedicated follow-up assistant if set; otherwise fall back to checklist assistant (has file_search; may have function tool but we only send text)
+    # Optional override assistant used specifically for the follow-up Q&A flow.
     @followup_assistant_id = ENV['FOLLOWUP_ASSISTANT_ID'].presence || ENV['Checklist_ASSISTANT_ID']
+    # Chat/model used by the non-Assistants requests (and/or any model selection logic we apply).
     @model = ENV['OPENAI_MODEL'] || 'gpt-4o'
     @log_accumulator = log_accumulator || []
     
@@ -99,6 +102,72 @@ class OpenaiService
       thread_id: thread_id,
       evaluation_input_tokens: (pass1_input + pass2_input),
       evaluation_output_tokens: (pass1_output + pass2_output)
+    }
+  end
+
+  # Streaming variant: processes each batch (Pass 1 + Pass 2), yields results via on_batch_complete.
+  # Used for progressive evaluation UX where results appear as each batch completes.
+  def analyze_checklist_streaming(uploaded_file_id: nil, vector_store_id:, checklist_items:, batch_size: 5, on_batch_complete: nil)
+    add_log('info', "=== Starting Checklist Analysis (Streaming) ===")
+    add_log('info', "Total items: #{checklist_items.length}, Batch size: #{batch_size}")
+
+    thread_id = create_thread(vector_store_id)
+    add_log('info', "Created thread #{thread_id} for streaming evaluation")
+
+    total_input = 0
+    total_output = 0
+    batches = checklist_items.each_slice(batch_size).to_a
+    total_batches = batches.length
+
+    batches.each_with_index do |batch_items, batch_index|
+      batch_num = batch_index + 1
+      add_log('info', "[STREAMING] Processing batch #{batch_num}/#{total_batches} (#{batch_items.length} items)")
+
+      begin
+        # Pass 1: retrieval for this batch only
+        batch_result = analyze_checklist_batch_with_retry(
+          thread_id,
+          batch_items,
+          batch_num,
+          total_batches,
+          max_retries: 3,
+          pass_label: 'PASS1'
+        )
+        pass1_results = batch_result[:results]
+        u = batch_result[:usage]
+        total_input += u[:input_tokens].to_i if u
+        total_output += u[:output_tokens].to_i if u
+
+        # Pass 2: rewrite this batch only (chunk of 1 = this batch)
+        pass2_results, p2_in, p2_out = rewrite_results_pass2(pass1_results: pass1_results)
+        total_input += p2_in
+        total_output += p2_out
+
+        batch_usage = { input_tokens: u&.dig(:input_tokens).to_i + p2_in, output_tokens: u&.dig(:output_tokens).to_i + p2_out }
+        on_batch_complete&.call(pass2_results, batch_usage) if on_batch_complete
+
+        if batch_index < batches.length - 1
+          add_log('info', "[STREAMING] Waiting 5 seconds before next batch...")
+          sleep 5
+        end
+      rescue => e
+        add_log('error', "[STREAMING] Batch #{batch_num} failed: #{e.message}")
+        batch_items.each do |item|
+          fallback = {
+            'item' => item,
+            'status' => 'No',
+            'remarks' => "Batch failed after retries: #{e.message}"
+          }
+          on_batch_complete&.call([fallback], { input_tokens: 0, output_tokens: 0 }) if on_batch_complete
+        end
+        raise e
+      end
+    end
+
+    {
+      thread_id: thread_id,
+      evaluation_input_tokens: total_input,
+      evaluation_output_tokens: total_output
     }
   end
 

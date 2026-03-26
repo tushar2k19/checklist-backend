@@ -7,7 +7,7 @@ class PerplexityService
   
   # Initialize method - runs when we create a new instance
   def initialize
-    # Get API key from environment variables
+    # API key for Perplexity web search integration.
     @@api_key = ENV['PERPLEXITY_API_KEY']
     
     # Check if API key exists

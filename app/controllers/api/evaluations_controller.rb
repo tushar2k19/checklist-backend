@@ -77,94 +77,46 @@ module Api
         return render_error("validation_error", "checklist_item_ids must be a non-empty array", status: :bad_request)
       end
 
+      # 3. Get checklist items (support optional item_text overrides from Editor's Items)
+      checklist_items = ChecklistItem.where(id: item_ids).index_by(&:id)
+      overrides = (params[:checklist_item_overrides] || {}).stringify_keys
+      valid_item_ids = item_ids.select { |id| (overrides[id.to_s].presence || checklist_items[id]&.item_text).present? }
+      checklist_texts = valid_item_ids.map { |id| overrides[id.to_s].presence || checklist_items[id].item_text }
+
+      if checklist_texts.empty?
+        evaluation = current_user.evaluations.create!(
+          uploaded_file: uploaded_file,
+          scheme: scheme,
+          document_type: doc_type,
+          status: 'failed',
+          total_checklist_items: 0
+        )
+        evaluation.mark_as_failed!("No valid checklist items found")
+        return render_error("validation_error", "Invalid checklist items", status: :unprocessable_entity)
+      end
+
       # 2. Create Evaluation record
       evaluation = current_user.evaluations.create!(
         uploaded_file: uploaded_file,
         scheme: scheme,
         document_type: doc_type,
-        status: 'pending'
+        status: 'pending',
+        total_checklist_items: checklist_texts.length
       )
-      
-      # 3. Get checklist items (support optional item_text overrides from Editor's Items)
-      checklist_items = ChecklistItem.where(id: item_ids).index_by(&:id)
-      overrides = (params[:checklist_item_overrides] || {}).stringify_keys
-      checklist_texts = item_ids.map { |id| overrides[id.to_s].presence || checklist_items[id]&.item_text }.compact
-      text_to_item = {}
-      item_ids.each do |id|
-        item = checklist_items[id]
-        next unless item
-        text = overrides[id.to_s].presence || item.item_text
-        text_to_item[text] = item
-      end
 
-      if checklist_texts.empty?
-        evaluation.mark_as_failed!("No valid checklist items found")
-        return render_error("validation_error", "Invalid checklist items", status: :unprocessable_entity)
-      end
+      # 4. Enqueue background job - returns immediately
+      EvaluationJob.perform_later(
+        evaluation.id,
+        checklist_texts,
+        valid_item_ids,
+        uploaded_file.id
+      )
 
-      begin
-        # 4. Call OpenAI Service with retry logic
-        start_time = Time.zone.now
-        log_accumulator = [] # Initialize log accumulator
-        analysis_response = perform_analysis_with_retry(
-          uploaded_file: uploaded_file,
-          checklist_items: checklist_texts,
-          evaluation: evaluation,
-          log_accumulator: log_accumulator
-        )
-        
-        results = analysis_response[:results]
-        thread_id = analysis_response[:thread_id]
-        processing_time = (Time.zone.now - start_time).to_i
-        logs = analysis_response[:logs] || ""
-
-        Rails.logger.info "Evaluation #{evaluation.id}: OpenAI analysis completed (thread_id=#{thread_id}, results=#{results.is_a?(Array) ? results.length : 'n/a'})"
-        
-        # 5. Store results and token usage for analytics
-        ActiveRecord::Base.transaction do
-          results.each do |result|
-            matched_item = text_to_item[result['item']] || checklist_items.values.find { |i| i.item_text == result['item'] }
-
-            if matched_item
-              evaluation.evaluation_checklist_items.create!(
-                checklist_item: matched_item,
-                status: result['status'],
-                remarks: clean_remarks(result['remarks'])
-              )
-            end
-          end
-
-          # 6. Mark as completed with thread_id
-          evaluation.mark_as_completed!(thread_id, processing_time, results)
-
-          # 7. Persist token usage for admin analytics
-          eval_in = analysis_response[:evaluation_input_tokens].to_i
-          eval_out = analysis_response[:evaluation_output_tokens].to_i
-          if eval_in.positive? || eval_out.positive?
-            TokenUsage.record_evaluation!(
-              user_id: current_user.id,
-              evaluation_id: evaluation.id,
-              input_tokens: eval_in,
-              output_tokens: eval_out
-            )
-          end
-
-          # Update file last analyzed
-          uploaded_file.touch(:last_analyzed_at)
-        end
-        
-        render_success(
-          evaluation_detail_serializer(evaluation).merge(logs: logs),
-          message: "Evaluation completed successfully",
-          status: :created
-        )
-        
-      rescue => e
-        evaluation.mark_as_failed!(e.message)
-        Rails.logger.error "Evaluation #{evaluation.id} failed after retries: #{e.message}"
-        Rails.logger.error e.backtrace.join("\n")
-        render_error("evaluation_failed", "Evaluation failed: #{e.message}", status: :internal_server_error)
-      end
+      render_success(
+        evaluation_detail_serializer(evaluation).merge(logs: nil),
+        message: "Evaluation started. Results will appear as they complete.",
+        status: :created
+      )
     end
 
     # GET /api/evaluations/:id
@@ -221,7 +173,9 @@ module Api
         uploaded_file_id: e.uploaded_file_id,
         status: e.status,
         summary: e.summary_stats,
-        processing_time: e.processing_time
+        processing_time: e.processing_time,
+        total_checklist_items: e.total_checklist_items,
+        error_message: e.error_message
       }
     end
     
@@ -235,93 +189,22 @@ module Api
           remarks: item.remarks
         }
       end
+      base[:progress] = progress_for(e) if e.processing?
       base
     end
-    
-    # Perform analysis with retry logic (3 attempts, exponential backoff)
-    def perform_analysis_with_retry(uploaded_file:, checklist_items:, evaluation:, log_accumulator:, max_retries: 3)
-      attempt = 0
-      last_error = nil
-      
-      while attempt < max_retries
-        attempt += 1
-        begin
-          log_entry = "[#{Time.zone.now.strftime('%Y-%m-%d %H:%M:%S %Z')}] [INFO] Evaluation #{evaluation.id}: Analysis attempt #{attempt}/#{max_retries}"
-          log_accumulator << log_entry
-          Rails.logger.info "Evaluation #{evaluation.id}: Analysis attempt #{attempt}/#{max_retries}"
-          
-          # Update evaluation status to processing before each attempt
-          evaluation.update!(status: 'processing') if attempt == 1
-          
-          openai_service = OpenaiService.new(log_accumulator: log_accumulator)
-          analysis_response = openai_service.analyze_checklist(
-            uploaded_file_id: uploaded_file.openai_file_id,
-            vector_store_id: uploaded_file.openai_vector_store_id,
-            checklist_items: checklist_items
-          )
-          
-          # Get logs from service
-          logs = openai_service.get_logs
-          analysis_response[:logs] = logs
-          
-          log_entry = "[#{Time.zone.now.strftime('%Y-%m-%d %H:%M:%S %Z')}] [INFO] Evaluation #{evaluation.id}: Analysis completed successfully on attempt #{attempt}"
-          log_accumulator << log_entry
-          Rails.logger.info "Evaluation #{evaluation.id}: Analysis completed successfully on attempt #{attempt}"
-          return analysis_response
-          
-        rescue => e
-          last_error = e
-          is_retryable = retryable_error?(e)
-          
-          log_entry = "[#{Time.zone.now.strftime('%Y-%m-%d %H:%M:%S %Z')}] [WARN] Evaluation #{evaluation.id}: Analysis attempt #{attempt} failed: #{e.message}"
-          log_accumulator << log_entry
-          Rails.logger.warn "Evaluation #{evaluation.id}: Analysis attempt #{attempt} failed: #{e.message}"
-          
-          if attempt < max_retries && is_retryable
-            wait_time = calculate_backoff(attempt)
-            log_entry = "[#{Time.zone.now.strftime('%Y-%m-%d %H:%M:%S %Z')}] [WARN] Evaluation #{evaluation.id}: Retrying in #{wait_time}s... (attempt #{attempt + 1}/#{max_retries})"
-            log_accumulator << log_entry
-            Rails.logger.warn "Evaluation #{evaluation.id}: Retrying in #{wait_time}s... (attempt #{attempt + 1}/#{max_retries})"
-            sleep wait_time
-          else
-            if !is_retryable
-              log_entry = "[#{Time.zone.now.strftime('%Y-%m-%d %H:%M:%S %Z')}] [ERROR] Evaluation #{evaluation.id}: Non-retryable error, stopping retries"
-              log_accumulator << log_entry
-              Rails.logger.error "Evaluation #{evaluation.id}: Non-retryable error, stopping retries"
-            else
-              log_entry = "[#{Time.zone.now.strftime('%Y-%m-%d %H:%M:%S %Z')}] [ERROR] Evaluation #{evaluation.id}: Max retries (#{max_retries}) reached"
-              log_accumulator << log_entry
-              Rails.logger.error "Evaluation #{evaluation.id}: Max retries (#{max_retries}) reached"
-            end
-            raise e
-          end
-        end
-      end
-      
-      raise last_error if last_error
-    end
-    
-    # Check if error is retryable
-    def retryable_error?(error)
-      error_message = error.message.downcase
-      
-      # Retry on network errors, timeouts, and 5xx server errors
-      return true if error_message.include?('timeout') || error_message.include?('timed out')
-      return true if error_message.include?('connection') || error_message.include?('network')
-      return true if error_message.include?('500') || error_message.include?('502') || 
-                     error_message.include?('503') || error_message.include?('504')
-      
-      # Retry on OpenAI API rate limits and temporary errors
-      return true if error_message.include?('rate limit') || error_message.include?('429')
-      return true if error_message.include?('service unavailable') || error_message.include?('temporary')
-      
-      false
-    end
-    
-    # Calculate exponential backoff delay
-    def calculate_backoff(attempt)
-      # Exponential backoff: 2s, 4s, 8s (capped at 10 seconds)
-      [2 ** attempt, 10].min
+
+    def progress_for(e)
+      total = e.total_checklist_items || e.evaluation_checklist_items.count
+      results_count = e.evaluation_checklist_items.count
+      batch_size = 3
+      total_batches = total.positive? ? (total.to_f / batch_size).ceil : 0
+      batches_completed = total_batches.positive? ? results_count / batch_size : 0
+      {
+        results_count: results_count,
+        total_items: total,
+        total_batches: total_batches,
+        batches_completed: batches_completed
+      }
     end
   end
 end
